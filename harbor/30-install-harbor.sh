@@ -1,22 +1,45 @@
 #!/usr/bin/env bash
-# Run ON the Harbor VM after 10-bootstrap-vm.sh.
-# Downloads the Harbor offline installer for $HARBOR_VERSION/$HARBOR_ARCH, renders harbor.yml
-# from the tarball's own template (so it tracks the version), installs certs, and runs
-# install.sh --with-trivy. Re-running on an installed Harbor does a safe reconfigure
-# (prepare + compose up), which is also how you apply harbor.yml changes.
+# Run on the Mac (Docker Desktop running). Downloads the Harbor offline installer for
+# $HARBOR_VERSION/$HARBOR_ARCH into $HARBOR_HOME, renders harbor.yml from the tarball's own template
+# (so it tracks the version), installs certs, adds the compose override (network alias), and runs
+# install.sh --with-trivy. Re-running on an installed Harbor does a safe reconfigure (prepare +
+# compose up), which is also how you apply harbor.yml changes. Idempotent.
+#
+# Layout under $HARBOR_HOME (default ~/Lab/harbor — NOT in iCloud Drive):
+#   harbor/      unpacked installer: harbor.yml, docker-compose.yml, common/      (= HARBOR_INSTALL_DIR)
+#   data/        registry blobs, Postgres, Valkey, Trivy DB, secret key           (= harbor.yml data_volume)
+#   log/         Harbor's log files                                               (= harbor.yml log.local.location)
+#   certs/       harbor.crt / harbor.key / ca.crt
+#   downloads/   installer tarballs
 set -euo pipefail
 # shellcheck source=../lab-env.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lab-env.sh"
+lab_need docker "install Docker Desktop"; lab_need curl ""; lab_need jq "brew install jq"; lab_need openssl "brew install openssl"
+lab_docker_ok
+docker compose version >/dev/null 2>&1 || lab_die "docker compose plugin missing (ships with Docker Desktop)"
 
-INSTALL_DIR=/opt/harbor
-CERT_DIR=/etc/harbor/certs
-DL_DIR="$HOME/lab/downloads"
-mkdir -p "$DL_DIR"
+case "$HARBOR_HOME" in
+  *"Mobile Documents"*|*CloudDocs*) lab_die "HARBOR_HOME=$HARBOR_HOME is inside iCloud Drive — registry data must not sync. Set HARBOR_HOME in lab-env.sh" ;;
+esac
+INSTALL_DIR="$HARBOR_INSTALL_DIR"
+DATA_DIR="$HARBOR_HOME/data"
+LOG_DIR="$HARBOR_HOME/log"
+CERT_DIR="$HARBOR_HOME/certs"
+DL_DIR="$HARBOR_HOME/downloads"
+mkdir -p "$HARBOR_HOME" "$DATA_DIR" "$LOG_DIR" "$CERT_DIR" "$DL_DIR"
+[[ -s "$LAB_CERTS/harbor.crt" && -s "$LAB_CERTS/harbor.key" ]] || lab_die "certs missing — ./harbor/20-gen-certs.sh"
 
-command -v docker >/dev/null || lab_die "docker missing — run 10-bootstrap-vm.sh"
-docker compose version >/dev/null 2>&1 || lab_die "docker compose plugin missing (or log out/in for the docker group)"
-ADMIN_PW="$(lab_secret harbor-admin.pw 'run harbor/00-push-to-vm.sh from the Mac')"
-DB_PW="$(lab_secret harbor-db.pw 'run harbor/00-push-to-vm.sh from the Mac')"
+# ---- 0. passwords (generated once, kept in secrets/) ----------------------------------
+umask 077
+for s in harbor-admin.pw harbor-db.pw; do
+  if [[ ! -s "$LAB_SECRETS/$s" ]]; then
+    openssl rand -base64 24 | tr -d '/+=' | cut -c1-24 > "$LAB_SECRETS/$s"
+    lab_log "generated secrets/$s"
+  fi
+done
+ADMIN_PW="$(lab_secret harbor-admin.pw '')"
+DB_PW="$(lab_secret harbor-db.pw '')"
+umask 022
 
 # ---- 1. download ---------------------------------------------------------------
 # 2.16.0-rc1 ships per-arch tarballs (…-arm64.tgz). Fall back to the un-suffixed name
@@ -33,79 +56,98 @@ for cand in "harbor-offline-installer-${HARBOR_VERSION}-${HARBOR_ARCH}.tgz" "har
 done
 [[ -n "$TGZ" ]] || lab_die "could not download a Harbor installer for ${HARBOR_VERSION}/${HARBOR_ARCH}"
 
-# md5sum file lists every asset; verify ours if we can fetch it.
-if curl -fsSL -o "$DL_DIR/md5sum" "${BASE}/md5sum" 2>/dev/null; then
-  if grep -q "$TGZ" "$DL_DIR/md5sum"; then
-    (cd "$DL_DIR" && grep "$TGZ" md5sum | md5sum -c -) || lab_die "md5 mismatch on $TGZ"
-    lab_log "checksum OK"
-  fi
+# md5sum file lists every asset; verify ours if we can fetch it (openssl: works on macOS and Linux).
+if curl -fsSL -o "$DL_DIR/md5sum" "${BASE}/md5sum" 2>/dev/null && grep -q "$TGZ" "$DL_DIR/md5sum"; then
+  expected="$(grep "$TGZ" "$DL_DIR/md5sum" | awk '{print $1}')"
+  actual="$(openssl dgst -md5 -r "$DL_DIR/$TGZ" | awk '{print $1}')"
+  [[ "$expected" == "$actual" ]] || lab_die "md5 mismatch on $TGZ"
+  lab_log "checksum OK"
 fi
 
 # ---- 2. unpack ---------------------------------------------------------------
 if [[ ! -x "$INSTALL_DIR/install.sh" ]]; then
   lab_log "unpacking to $INSTALL_DIR"
-  sudo mkdir -p "$INSTALL_DIR"
-  sudo tar -xzf "$DL_DIR/$TGZ" -C "$(dirname "$INSTALL_DIR")"   # tarball root is 'harbor/'
-  sudo chown -R root:root "$INSTALL_DIR"
+  tar -xzf "$DL_DIR/$TGZ" -C "$HARBOR_HOME"          # tarball root is 'harbor/'
 fi
 
 # ---- 3. certs ----------------------------------------------------------------
 lab_log "installing TLS cert/key to $CERT_DIR"
-sudo mkdir -p "$CERT_DIR"
-sudo install -m 644 "$LAB_CERTS/harbor.crt" "$CERT_DIR/harbor.crt"
-sudo install -m 600 "$LAB_CERTS/harbor.key" "$CERT_DIR/harbor.key"
-sudo install -m 644 "$LAB_CERTS/ca.crt"     "$CERT_DIR/ca.crt"
-# Let the local docker CLI trust Harbor too (handy for `docker login` tests on this box).
-sudo mkdir -p "/etc/docker/certs.d/${HARBOR_HOST}"
-sudo install -m 644 "$LAB_CERTS/ca.crt" "/etc/docker/certs.d/${HARBOR_HOST}/ca.crt"
+install -m 644 "$LAB_CERTS/harbor.crt" "$CERT_DIR/harbor.crt"
+install -m 600 "$LAB_CERTS/harbor.key" "$CERT_DIR/harbor.key"
+install -m 644 "$LAB_CERTS/ca.crt"     "$CERT_DIR/ca.crt"
 
 # ---- 4. harbor.yml -------------------------------------------------------------
 # Start from the shipped template every time so new keys appear; then patch the handful we own.
+# (python rather than sed: BSD sed has no "first match only" address, and -i differs from GNU sed.)
 lab_log "rendering harbor.yml from harbor.yml.tmpl"
-sudo cp "$INSTALL_DIR/harbor.yml.tmpl" "$INSTALL_DIR/harbor.yml"
-sudo sed -i \
-  -e "s|^hostname: .*|hostname: ${HARBOR_HOST}|" \
-  -e "s|^  certificate: .*|  certificate: ${CERT_DIR}/harbor.crt|" \
-  -e "s|^  private_key: .*|  private_key: ${CERT_DIR}/harbor.key|" \
-  -e "s|^harbor_admin_password: .*|harbor_admin_password: ${ADMIN_PW}|" \
-  -e "0,/^  password: .*/s|^  password: .*|  password: ${DB_PW}|" \
-  -e "s|^data_volume: .*|data_volume: /data|" \
-  "$INSTALL_DIR/harbor.yml"
-# Trivy: scan unfixed too (you want to see them), keep DB fresh from GHCR.
-sudo sed -i -e "s|^  ignore_unfixed: .*|  ignore_unfixed: false|" "$INSTALL_DIR/harbor.yml"
-sudo chmod 600 "$INSTALL_DIR/harbor.yml"
+cp "$INSTALL_DIR/harbor.yml.tmpl" "$INSTALL_DIR/harbor.yml"
+HARBOR_YML="$INSTALL_DIR/harbor.yml" CERT_DIR="$CERT_DIR" DATA_DIR="$DATA_DIR" LOG_DIR="$LOG_DIR" \
+ADMIN_PW="$ADMIN_PW" DB_PW="$DB_PW" HTTP_PORT="$HARBOR_HTTP_PORT" HTTPS_PORT="$HARBOR_HTTPS_PORT" \
+python3 - <<'PY'
+import os, re
+p = os.environ["HARBOR_YML"]
+lines = open(p).read().split("\n")
+def set_first(pattern, value, start=0):
+    rx = re.compile(pattern)
+    for i in range(start, len(lines)):
+        if rx.match(lines[i]):
+            indent = re.match(r"\s*", lines[i]).group(0)
+            lines[i] = f"{indent}{value}"
+            return i
+    raise SystemExit(f"harbor.yml: no line matches {pattern!r}")
+set_first(r"^hostname:", f"hostname: {os.environ['HARBOR_HOST']}")
+set_first(r"^  port: 80\b",  f"port: {os.environ['HTTP_PORT']}")
+i = set_first(r"^https:", "https:")
+set_first(r"^  port: 443\b",   f"port: {os.environ['HTTPS_PORT']}", i)
+set_first(r"^  certificate:",  f"certificate: {os.environ['CERT_DIR']}/harbor.crt", i)
+set_first(r"^  private_key:",  f"private_key: {os.environ['CERT_DIR']}/harbor.key", i)
+set_first(r"^harbor_admin_password:", f"harbor_admin_password: {os.environ['ADMIN_PW']}")
+i = set_first(r"^database:", "database:")
+set_first(r"^  password:", f"password: {os.environ['DB_PW']}", i)
+set_first(r"^data_volume:", f"data_volume: {os.environ['DATA_DIR']}")
+i = set_first(r"^trivy:", "trivy:")
+set_first(r"^  ignore_unfixed:", "ignore_unfixed: false", i)      # scan unfixed too (you want to see them)
+i = set_first(r"^log:", "log:")
+i = set_first(r"^  local:", "local:", i)
+set_first(r"^    location:", f"location: {os.environ['LOG_DIR']}", i)   # /var/log is not shared with Docker Desktop
+open(p, "w").write("\n".join(lines))
+PY
+chmod 600 "$INSTALL_DIR/harbor.yml"
+grep -E '^(hostname|data_volume):|^  (certificate|private_key):|^    location:' "$INSTALL_DIR/harbor.yml" | sed 's/^/  /'
 
-# Sanity: the values we care about landed.
-grep -E '^(hostname|data_volume):|^  (certificate|private_key):' "$INSTALL_DIR/harbor.yml" | sed 's/^/  /'
+# ---- 5. compose override: DNS alias so k3d nodes and runners reach nginx as $HARBOR_HOST ----
+lab_render "$LAB_ROOT/harbor/docker-compose.override.yml.template" > "$INSTALL_DIR/docker-compose.override.yml"
 
-# ---- 5. install / reconfigure --------------------------------------------------------
+# ---- 6. install / reconfigure --------------------------------------------------------
 cd "$INSTALL_DIR"
-if [[ -s docker-compose.yml ]] && sudo docker compose ps --status running 2>/dev/null | grep -q harbor-core; then
+if [[ -s docker-compose.yml ]] && docker compose ps --status running 2>/dev/null | grep -q harbor-core; then
   lab_log "Harbor already running — applying config (prepare + compose up)"
-  sudo ./prepare --with-trivy
-  sudo docker compose down
-  sudo docker compose up -d
+  ./prepare --with-trivy
+  docker compose stop            # not `down`: k3d nodes may be attached to the harbor network
+  docker compose up -d
 else
-  lab_log "running install.sh --with-trivy (loads images from the tarball, ~2-4 min)"
-  sudo ./install.sh --with-trivy
+  lab_log "running install.sh --with-trivy (loads arm64 images from the tarball, ~2-4 min)"
+  ./install.sh --with-trivy
 fi
 
-# ---- 6. wait + report ---------------------------------------------------------------
-lab_log "waiting for https://${HARBOR_HOST}/api/v2.0/health"
+# ---- 7. wait + report ---------------------------------------------------------------
+lab_log "waiting for https://${HARBOR_HOST}:${HARBOR_HTTPS_PORT}/api/v2.0/health"
 for _ in $(seq 1 60); do
-  if curl -fsS --cacert "$CERT_DIR/ca.crt" --resolve "${HARBOR_HOST}:443:127.0.0.1" \
-       "https://${HARBOR_HOST}/api/v2.0/health" | jq -e '.status=="healthy"' >/dev/null 2>&1; then
+  if curl -fsS --cacert "$CERT_DIR/ca.crt" --resolve "${HARBOR_HOST}:${HARBOR_HTTPS_PORT}:127.0.0.1" \
+       "https://${HARBOR_HOST}:${HARBOR_HTTPS_PORT}/api/v2.0/health" | jq -e '.status=="healthy"' >/dev/null 2>&1; then
     lab_log "Harbor is healthy"; break
   fi
   sleep 5
 done
-sudo docker compose ps --format 'table {{.Name}}\t{{.Status}}'
+docker compose ps --format 'table {{.Name}}\t{{.Status}}'
+docker network inspect "$HARBOR_NETWORK" --format '{{range .Containers}}{{.Name}} {{end}}' | grep -q nginx \
+  || lab_warn "nginx is not on $HARBOR_NETWORK — check docker-compose.override.yml"
 
 cat <<EOF
 
 Harbor ${HARBOR_VERSION} installed.
-  UI:        https://${HARBOR_HOST}/   (admin / \$(cat ~/lab/secrets/harbor-admin.pw))
-  manage:    cd ${INSTALL_DIR} && sudo docker compose [ps|logs -f|down|up -d]
-  reconfig:  edit this script's sed block or ${INSTALL_DIR}/harbor.yml, then re-run this script
-Next, on the Mac:  ./harbor/40-init-harbor.sh
+  UI:        https://${HARBOR_HOST}/   (admin / \$(cat secrets/harbor-admin.pw))
+  manage:    docker compose --project-directory "${INSTALL_DIR}" [ps|logs -f|stop|up -d]
+  reconfig:  edit this script's patch block or ${INSTALL_DIR}/harbor.yml, then re-run this script
+Next:  ./harbor/40-init-harbor.sh   (skip after a restore from backup — docs/07 §3)
 EOF

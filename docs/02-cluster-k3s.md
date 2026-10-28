@@ -1,45 +1,57 @@
-# 02 — Cluster: reusing `k3s-lab`
+# 02 — Cluster: `k3s-lab` on k3d
 
-The cluster already exists: `~/Virtual Machines.localized/k3s-lab` — 1 server + 2 agents, Ubuntu 24.04 ARM64,
-K3s pinned to **v1.34** (same minor as work VKS), default add-ons (Traefik, CoreDNS, local-path, metrics-server).
-This doc covers what the lab adds to it; `lab.sh` remains the way you start/stop/destroy it.
+The cluster is k3d: 1 server + 2 agents, each a container running `rancher/k3s:v1.34.x` (pinned in `lab-env.sh`,
+same minor as work VKS), default add-ons (Traefik, CoreDNS, local-path, metrics-server). It is declared in
+`k3s/k3d-config.yaml.template`, created by `lab.sh create-cluster`, and disposable: Harbor lives outside it.
 
-## 1. Bring it up and point this lab at it
+## 1. Create it and point this lab at it
+
+Harbor must be installed and running first (docs/03) — the nodes join Harbor's docker network and mount the
+registries file, so `create-cluster` refuses to run without `harbor_harbor` and `secrets/registries.yaml`.
 
 ```bash
-cd ~/Virtual\ Machines.localized/k3s-lab
-./lab.sh up && ./lab.sh status          # note the node IPs → K3S_SERVER_IP / K3S_AGENT_IPS in lab-env.sh
-kubectl config use-context k3s-lab      # or whatever context lab.sh created; `kubectl config get-contexts`
+cd "$HOME/Library/Mobile Documents/com~apple~CloudDocs/Kubernetes Lab"
+source lab-env.sh
+./k3s/10-render-registries.sh            # secrets/registries.yaml: Harbor auth + CA, docker.io → proxy cache
+./lab.sh create-cluster                  # ~90 s; writes context k3d-k3s-lab into ~/.kube/config and switches to it
 kubectl get nodes -o wide
 ```
 
-If `lab.sh` hands out DHCP addresses rather than fixed ones, give the three VMs reservations the same way as
-the Harbor VM (docs/03 §2) — `registries.yaml`, the runner's kubeconfig and `/etc/hosts` all assume stable IPs.
+What the template sets, and why:
+
+| Key | Value | Why |
+|---|---|---|
+| `image` | `$K3S_IMAGE` (`rancher/k3s:v1.34.12-k3s1`) | k3d's own default is newer than VKS; always pin |
+| `network` | `harbor_harbor` | nodes resolve `harbor.lab.internal` to Harbor's nginx; runners resolve the server node |
+| `kubeAPI` | `127.0.0.1:6443` | `kubectl` on the Mac; not exposed on the LAN |
+| `ports` | `8080:80`, `8443:443` on the load balancer | Traefik; Harbor owns 80/443 on the Mac |
+| `volumes` | `secrets/certs/ca.crt` → `/etc/ssl/certs/kubernetes-lab-ca.crt`, `secrets/registries.yaml` → `/etc/rancher/k3s/registries.yaml` on every node | the same files a real node would carry (docs/04 §1) |
+| `--tls-san=k3d-k3s-lab-server-0` | server nodes | the runners' kubeconfig uses that name |
+| `runtime.serversMemory/agentsMemory` | 1.5 g / 1 g | soft caps so one runaway pod cannot starve Harbor |
 
 ## 2. k9s
 
 ```bash
 brew install derailed/k9s/k9s           # v0.51.x
-k9s --context k3s-lab
+k9s --context k3d-k3s-lab
 ```
 
 Useful in this lab: `:ns` → pick `containerhelper`; `:deploy`; `l` logs; `s` shell; `:events`; `:pulse` overview.
 Set `k9s` to open in the solution namespaces by default: `~/Library/Application Support/k9s/config.yaml` →
-`k9s.clusters.k3s-lab.namespace.favorites: [containerhelper, devopshelpers, lab-sandbox]`.
-The runner VM gets k9s too (`runner/10-prep-runner-vm.sh`), handy when you SSH in to debug a failed job.
+`k9s.clusters.k3d-k3s-lab.namespace.favorites: [containerhelper, devopshelpers, lab-sandbox]`.
+The runner image has k9s too (`docker exec -it runner-containerhelper k9s`), handy when debugging a failed job.
 
 ## 3. What the lab adds to the cluster
 
 | Step | File | Effect |
 |---|---|---|
-| CA + registry auth on nodes | `k3s/10-trust-harbor-ca.sh` | `/etc/rancher/k3s/registries.yaml` on all nodes: Harbor creds (`robot$k3s-pull`), lab CA, and `docker.io` **mirrored through the Harbor proxy cache**; restarts `k3s` / `k3s-agent` |
+| CA + registry auth on nodes | `k3s/10-render-registries.sh` + the mounts in `k3d-config.yaml.template` | `/etc/rancher/k3s/registries.yaml` on all nodes: Harbor creds (`robot$k3s-pull`), lab CA, and `docker.io` **mirrored through the Harbor proxy cache**. Re-running after a robot rotation restarts the cluster so K3s regenerates `hosts.toml` |
 | Namespaces | `k3s/20-namespaces.yaml` | `containerhelper`, `devopshelpers` with **PSA `restricted` enforced**; `lab-sandbox` at `baseline` for toolbox experiments |
 | Deployer identity | `k3s/30-deployer-rbac.yaml` | SA `gha-deployer` + namespaced `deployer` Role in both namespaces; read-only nodes/namespaces cluster-wide |
-| Runner kubeconfig | `k3s/40-make-kubeconfig.sh` | `secrets/kubeconfig-gha-deployer.yaml` with a long-lived SA token, API server = `https://<K3S_SERVER_IP>:6443` |
+| Runner kubeconfig | `k3s/40-make-kubeconfig.sh` | `secrets/kubeconfig-gha-deployer.yaml` with a long-lived SA token, API server = `https://k3d-k3s-lab-server-0:6443` (resolvable from the runner containers) |
 | Pull secret | `k3s/50-pull-secrets.sh` | `harbor-pull` docker-registry Secret in each namespace, attached to the `default` SA |
 
 ```bash
-./k3s/10-trust-harbor-ca.sh
 kubectl apply -f k3s/20-namespaces.yaml -f k3s/30-deployer-rbac.yaml
 ./k3s/50-pull-secrets.sh
 ./k3s/40-make-kubeconfig.sh
@@ -70,19 +82,32 @@ above (the `lab-sandbox` namespace is there for when it doesn't).
 
 ## 5. Resource budget
 
-| VM | vCPU | RAM | Notes |
-|---|---|---|---|
-| k3s-server | 2 | 4 GB | control plane + Traefik; schedulable |
-| k3s-agent-1/2 | 2 | 4 GB each | app workloads |
-| harbor | 2 | 4 GB | |
-| runner | 2 | 4 GB | docker buildx + .NET SDK builds want this |
-| **total** | 10 | **20 GB** of 24 GB |
+| Component | RAM (steady) | Notes |
+|---|---|---|
+| Harbor (10 containers, Trivy idle) | ~2.5 GB | a Trivy scan adds ~1 GB while it runs |
+| `k3d-k3s-lab-server-0` | ≤ 1.5 GB | control plane + Traefik; schedulable |
+| `k3d-k3s-lab-agent-0/1` | ≤ 1 GB each | app workloads |
+| two runners idle | ~0.3 GB | a .NET build inside a job adds 2–3 GB while it runs |
+| **Docker Desktop VM** | **12 GB** (6 CPU) | Settings → Resources. 10 GB works if you run one build at a time |
 
-Options when it's too much: drop agents to 3 GB each (edit the `.vmx` `memsize` while powered off), or suspend
-the runner VM between builds. The Harbor VM has to stay up while the cluster is pulling.
+Change node caps in `lab-env.sh` (`K3D_SERVER_MEMORY`, `K3D_AGENT_MEMORY`) and re-create the cluster.
 
-## 6. Destroy / recreate the cluster without losing anything
+## 6. Nodes without SSH
 
-Because Harbor and the runner live outside the cluster, `./lab.sh destroy && ./lab.sh up` followed by
-section 3 above gets you back to a working pipeline in ~10 minutes. The `secrets/` folder has everything;
-only `k3s/40-make-kubeconfig.sh` needs re-running (new cluster CA + token) and the result re-copied to the runner.
+`docker exec` is the SSH of this lab:
+
+```bash
+./lab.sh shell                                           # sh on k3d-k3s-lab-server-0
+./lab.sh shell k3d-k3s-lab-agent-1
+docker exec k3d-k3s-lab-agent-0 cat /etc/rancher/k3s/registries.yaml
+docker exec k3d-k3s-lab-server-0 k3s crictl pull harbor.lab.internal/dockerhub/library/alpine:3.20
+docker logs k3d-k3s-lab-server-0 --tail 100              # journalctl -u k3s equivalent
+k3d node stop k3d-k3s-lab-agent-1 && k3d node start k3d-k3s-lab-agent-1   # simulate a node outage
+```
+
+## 7. Destroy / recreate the cluster without losing anything
+
+Because Harbor and the runners live outside the cluster, `./lab.sh destroy-cluster && ./lab.sh create-cluster`
+followed by section 3 above gets you back to a working pipeline in ~3 minutes. The `secrets/` folder has
+everything; only `k3s/40-make-kubeconfig.sh` needs re-running (new cluster CA + token), then
+`docker compose -f runner/docker-compose.yml restart` so the runners pick up the new file.

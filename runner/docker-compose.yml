@@ -1,0 +1,78 @@
+# GitHub Actions runners for the lab — one container per repo (personal account = per-repo runners).
+# Run through lab.sh (which sources lab-env.sh) or directly from the repo root:
+#   source lab-env.sh && docker compose -f runner/docker-compose.yml up -d --build
+# Relative paths below resolve against this file's directory, so defaults work without lab-env.sh.
+name: lab-runners
+
+x-build: &build
+  context: .
+  args:
+    RUNNER_VERSION: ${RUNNER_VERSION:-2.338.2}
+    K3S_CHANNEL: ${K3S_CHANNEL:-v1.34}
+    K9S_VERSION: ${K9S_VERSION:-v0.51.0}
+  additional_contexts:
+    certs: ${LAB_CERTS:-../secrets/certs}      # COPY --from=certs ca.crt
+
+x-env: &env
+  KUBECONFIG: /etc/github-runner/kubeconfig
+  DOCKER_BUILDKIT: "1"
+  HARBOR_HOST: ${HARBOR_HOST:-harbor.lab.internal}
+  RUNNER_LABELS: ${RUNNER_LABELS:-k3s-lab,harbor,arm64}
+
+services:
+  runner-containerhelper:
+    build: *build
+    image: lab/actions-runner:${RUNNER_VERSION:-2.338.2}
+    container_name: runner-containerhelper
+    restart: unless-stopped
+    # Docker Desktop mounts the socket as root:root 0660 inside containers; adding the root group
+    # to the (non-root) runner user is the usual fix. Same trust as the old VM: the socket is root
+    # on the Docker VM, so keep the repos private (docs/05 §4).
+    group_add: ["0"]
+    environment:
+      <<: *env
+      RUNNER_URL: https://github.com/${GH_OWNER:-denmanjohn-maker}/ContainerHelperAdditions
+      RUNNER_NAME: runner-containerhelper
+      RUNNER_TOKEN_FILE: /run/secrets/runner-token-containerhelper
+    secrets: [runner-token-containerhelper]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${LAB_SECRETS:-../secrets}/kubeconfig-gha-deployer.yaml:/etc/github-runner/kubeconfig:ro
+      - runner-containerhelper-home:/home/runner
+    networks: [harbor]
+
+  runner-devopshelpers:
+    build: *build
+    image: lab/actions-runner:${RUNNER_VERSION:-2.338.2}
+    container_name: runner-devopshelpers
+    restart: unless-stopped
+    group_add: ["0"]
+    environment:
+      <<: *env
+      RUNNER_URL: https://github.com/${GH_OWNER:-denmanjohn-maker}/DevOpsHelperTools
+      RUNNER_NAME: runner-devopshelpers
+      RUNNER_TOKEN_FILE: /run/secrets/runner-token-devopshelpers
+    secrets: [runner-token-devopshelpers]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${LAB_SECRETS:-../secrets}/kubeconfig-gha-deployer.yaml:/etc/github-runner/kubeconfig:ro
+      - runner-devopshelpers-home:/home/runner
+    networks: [harbor]
+
+# One-hour registration tokens from GitHub → Settings → Actions → Runners → New self-hosted runner.
+# Only read on first start (the runner keeps its own credential in the home volume afterwards);
+# the files must exist for compose to start, stale content is fine.
+secrets:
+  runner-token-containerhelper:
+    file: ${LAB_SECRETS:-../secrets}/runner-token-containerhelper
+  runner-token-devopshelpers:
+    file: ${LAB_SECRETS:-../secrets}/runner-token-devopshelpers
+
+volumes:
+  runner-containerhelper-home:
+  runner-devopshelpers-home:
+
+networks:
+  harbor:
+    name: ${HARBOR_NETWORK:-harbor_harbor}   # Harbor's compose network: resolves harbor.lab.internal and the k3d nodes
+    external: true

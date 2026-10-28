@@ -1,0 +1,18 @@
+# Rendered by harbor/30-install-harbor.sh into $HARBOR_INSTALL_DIR/docker-compose.override.yml.
+# `docker compose` merges it with Harbor's generated docker-compose.yml automatically, and Harbor's
+# `prepare` never rewrites it. It gives the nginx front end (service "proxy") a DNS alias on the
+# compose network, so k3d nodes and the runner containers — all attached to that network — reach
+# Harbor as https://${HARBOR_HOST} without touching /etc/hosts anywhere but the Mac.
+services:
+  proxy:
+    networks:
+      harbor:
+        aliases:
+          - ${HARBOR_HOST}
+          - harbor
+
+# Fallback if the Harbor "log" container's syslog-on-localhost pattern misbehaves on Docker Desktop
+# (docs/08 §1): send container logs to Docker instead of the log container.
+#  core:        { logging: { driver: json-file } }
+#  jobservice:  { logging: { driver: json-file } }
+#  registry:    { logging: { driver: json-file } }

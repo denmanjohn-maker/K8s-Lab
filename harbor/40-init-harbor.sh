@@ -11,7 +11,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lab-env.sh"
 lab_need curl ""; lab_need jq "brew install jq"
 
 ROTATE=0; [[ "${1:-}" == "--rotate-robots" ]] && ROTATE=1
-ADMIN_PW="$(lab_secret harbor-admin.pw 'run harbor/00-push-to-vm.sh first')"
+ADMIN_PW="$(lab_secret harbor-admin.pw 'run harbor/30-install-harbor.sh first')"
 API="https://${HARBOR_HOST}/api/v2.0"
 
 h() { # h METHOD PATH [JSON]
@@ -104,5 +104,5 @@ Harbor initialised at https://${HARBOR_HOST}/
   robots:      $(cat "$LAB_SECRETS/harbor-robot-${HARBOR_ROBOT_PUSH}.user" 2>/dev/null)  $(cat "$LAB_SECRETS/harbor-robot-${HARBOR_ROBOT_PULL}.user" 2>/dev/null)
   test pull:   docker pull ${HARBOR_HOST}/${HARBOR_PROXY_PROJECT}/library/alpine:3.20
   test login:  docker login ${HARBOR_HOST} -u "\$(cat secrets/harbor-robot-${HARBOR_ROBOT_PUSH}.user)" -p "\$(cat secrets/harbor-robot-${HARBOR_ROBOT_PUSH}.token)"
-Next:  ./k3s/10-trust-harbor-ca.sh
+Next:  ./k3s/10-render-registries.sh  then  ./lab.sh create-cluster
 EOF

@@ -19,7 +19,7 @@ so you change the layout in **Settings → Variables**, not in the YAML.
 | | `HARBOR_ROBOT_TOKEN` | `cat secrets/harbor-robot-gha-push.token` |
 | Settings → Variables → Actions (optional) | `HARBOR_HOST` `HARBOR_PROJECT` `IMAGE_NAME` `DOCKERFILE` `KUSTOMIZE_DIR` `K8S_NAMESPACE` | only if the defaults don't fit |
 | Settings → Environments | `k3s-lab` | the `deploy` job targets it; add "required reviewers" if you want a manual gate |
-| Settings → Actions → Runners | runner with label **`k3s-lab`** | docs/05 §4 |
+| Settings → Actions → Runners | runner container with label **`k3s-lab`** | docs/05 §4 |
 
 With `gh` from the Mac:
 
@@ -42,9 +42,9 @@ workflow_dispatch ─► all (deploy optional via input)
 | Job | Runs | Notes |
 |---|---|---|
 | `lint` | shellcheck (`-S warning -x`) on every tracked shell script; `sh -n` under **Alpine 3.20 and Ubuntu 24.04** pulled through the Harbor proxy cache | Matches your Alpine + Noble compatibility requirement for the app-* scripts. Skips if there are no scripts |
-| `build` | `docker/build-push-action` → `harbor.lab.internal/<project>/<image>:sha-<12>` (+ `:latest` on main), `linux/arm64`, registry build cache at `:buildcache` | Skips with a notice if `DOCKERFILE` doesn't exist. `provenance: false` keeps a plain manifest so Trivy scans it directly. Add `linux/amd64` to `PLATFORMS` when you want the same image for x86 clusters (QEMU via binfmt; slow) |
+| `build` | `docker/build-push-action` → `harbor.lab.internal/<project>/<image>:sha-<12>` (+ `:latest` on main), `linux/arm64`, registry build cache at `:buildcache` | Skips with a notice if `DOCKERFILE` doesn't exist. `provenance: false` keeps a plain manifest so Trivy scans it directly. Add `linux/amd64` to `PLATFORMS` when you want the same image for x86 clusters (Docker Desktop emulates it; slow) |
 | `scan-gate` | polls Harbor `GET /projects/{p}/repositories/{r}/artifacts/{digest}?with_scan_overview=true` up to 6 min; writes the severity table to the job summary; fails if `Critical > MAX_CRITICAL` (default 0) | Harbor auto-scans on push (project setting from `40-init-harbor.sh`). This is where an EPSS/KEV filter would go — Harbor exposes the full Trivy report at `/additions/vulnerabilities` for the `robot$gha-push` account |
-| `deploy` | `kustomize edit set image <image>=<harbor image>@<digest>` in the overlay, `kustomize build \| kubectl apply --server-side`, `rollout status` | Deploys **by digest**, never by tag. `KUBECONFIG=/etc/github-runner/kubeconfig` — the SA from docs/02 §3. Skips with a notice if the overlay doesn't exist |
+| `deploy` | `kustomize edit set image <image>=<harbor image>@<digest>` in the overlay, `kustomize build \| kubectl apply --server-side`, `rollout status` | Deploys **by digest**, never by tag. `KUBECONFIG=/etc/github-runner/kubeconfig` — the SA from docs/02 §3, mounted into the runner container. Skips with a notice if the overlay doesn't exist |
 
 ## 3. Adapting to each repo
 
@@ -79,9 +79,9 @@ one of the main reasons to have this lab.
 
 In Dockerfiles, prefer `FROM harbor.lab.internal/dockerhub/library/alpine:3.20` over `FROM alpine:3.20` when building
 *in the lab*: no Hub rate limits, and the base image gets scanned and stays visible in Harbor. For images that must
-build identically at work, keep `FROM alpine:3.20` and rely on the runner's Docker daemon being configured with
-Harbor as a registry mirror instead (`/etc/docker/daemon.json` → `"registry-mirrors": ["https://harbor.lab.internal"]`
-does **not** work for proxy-cache projects — Harbor needs the project prefix — so the `FROM` rewrite is the honest option).
+build identically at work, keep `FROM alpine:3.20` and accept that the build pulls from Docker Hub directly: a
+`registry-mirrors` entry in Docker Desktop's engine settings does **not** work for proxy-cache projects — Harbor needs the
+project prefix — so the `FROM` rewrite is the honest option.
 
 ## 5. Promoting to GHCR later
 

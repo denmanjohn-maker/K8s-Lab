@@ -1,113 +1,89 @@
-# 05 — On-prem GitHub Actions runner VM
+# 05 — On-prem GitHub Actions runners (containers)
 
-Split of responsibilities: the lab prepares the VM (tools, Docker, CA trust, service user, kubeconfig); **you
-install and register `actions-runner`** (§4). Workflows target the runner with `runs-on: [self-hosted, k3s-lab]`.
+Two long-lived runner containers, one per repo, built from GitHub's official runner image plus the tools the
+workflows use. Workflows target them with `runs-on: [self-hosted, k3s-lab]`. The split of responsibilities is the
+same as before: the lab builds the image and wires Docker, the CA and the kubeconfig; **you** supply the GitHub
+registration token.
 
-## 1. Create the VM (Fusion)
+## 1. What is in the image — `runner/Dockerfile`
 
-| Setting | Value |
+| Layer | Content |
 |---|---|
-| Image | Ubuntu Server 24.04.x arm64 |
-| Name | `runner` |
-| vCPU / RAM / Disk | 2 / 4 GB / 40 GB (docker build cache lives here; grow the disk if builds are big) |
-| Network | Share with my Mac (NAT) — same vmnet8 |
-| Installer | user `john`, OpenSSH server, hostname `runner`, fixed IP = `RUNNER_IP` (DHCP reservation, docs/03 §2) |
+| base | `ghcr.io/actions/actions-runner:2.338.x`: Ubuntu 24.04, user `runner` (uid 1001), Docker CLI + buildx, the runner unpacked in `/home/runner` |
+| lab tools | kubectl (latest v1.34.x), kustomize, helm 3, k9s, yq, jq, trivy, shellcheck, git, rsync |
+| trust | lab CA in the OS store (`COPY --from=certs`, docs/04 §2) |
+| entrypoint | `runner/entrypoint.sh`: `config.sh` on first start (reads the token from `secrets/`), then `run.sh` |
+
+Rebuild after changing the Dockerfile, the CA, or `RUNNER_VERSION` in `lab-env.sh`:
 
 ```bash
-./scripts/hosts-entries.sh --push      # adds the runner to every machine's /etc/hosts
-ssh john@runner.lab.internal
+source lab-env.sh
+docker compose -f runner/docker-compose.yml build --pull
 ```
 
-## 2. Prep the VM (Mac → VM)
+(The runner self-updates its own binaries inside the home volume; the image rebuild is for the tools.)
+
+## 2. How the containers are wired — `runner/docker-compose.yml`
+
+| Item | Setting | Why |
+|---|---|---|
+| Docker | `/var/run/docker.sock` mounted; `group_add: ["0"]` | jobs build with Docker Desktop's engine (same engine as the Mac). The socket is `root:root 0660` inside containers on Docker Desktop, so the runner user is added to the root group. Holding the socket = root on the Docker VM, as the old VM runner was root on its own Docker |
+| kubeconfig | `secrets/kubeconfig-gha-deployer.yaml` → `/etc/github-runner/kubeconfig`, read-only; `KUBECONFIG` set | the `gha-deployer` SA (docs/02 §3); the server address is `https://k3d-k3s-lab-server-0:6443`, resolvable because… |
+| network | `harbor_harbor` (external) | …the runners sit on Harbor's docker network with the k3d nodes; `harbor.lab.internal` resolves to nginx |
+| state | named volume per runner at `/home/runner` | `.runner`, `.credentials`, `_work` and the self-updated runner survive restarts and image rebuilds |
+| registration | compose secret `runner-token-<repo>` from `secrets/runner-token-<repo>` | read only when `.runner` is absent; stale afterwards, but the file must exist for compose to start |
+| restart | `unless-stopped` | Docker Desktop brings the runners back at login |
+
+Memory: an idle runner is ~150 MB; a .NET build inside a job needs 2–3 GB of the Docker Desktop VM while it runs.
+
+## 3. Install the deploy kubeconfig
 
 ```bash
-# Mac
-cd "$HOME/Library/Mobile Documents/com~apple~CloudDocs/Kubernetes Lab"
-ssh john@runner.lab.internal 'mkdir -p ~/lab/certs'
-rsync -az lab-env.sh runner john@runner.lab.internal:~/lab/
-rsync -az secrets/certs/ca.crt john@runner.lab.internal:~/lab/certs/
-ssh john@runner.lab.internal 'chmod +x ~/lab/runner/*.sh'
-
-# VM
-~/lab/runner/10-prep-runner-vm.sh                 # add --with-dotnet if you build .NET outside containers
+./k3s/40-make-kubeconfig.sh      # → secrets/kubeconfig-gha-deployer.yaml (0600), server = k3d-k3s-lab-server-0
 ```
 
-Installs: Docker CE + buildx (+ amd64 binfmt for cross-builds), kubectl v1.34.x, kustomize, helm, k9s,
-yq, jq, trivy, shellcheck, git; trusts the lab CA in the OS store **and** `/etc/docker/certs.d/harbor.lab.internal/`;
-creates the service user **`runner`** (docker group); creates `/etc/github-runner/` for the kubeconfig; ufw allows
-SSH only (the runner is outbound-only — GitHub never connects in).
+Nothing to copy: the compose file mounts it. After re-running (cluster rebuilt): `docker compose -f runner/docker-compose.yml restart`.
 
-## 3. Install the deploy kubeconfig (Mac → VM)
-
-```bash
-./k3s/40-make-kubeconfig.sh      # if not done yet → secrets/kubeconfig-gha-deployer.yaml
-scp secrets/kubeconfig-gha-deployer.yaml john@runner.lab.internal:/tmp/kubeconfig
-ssh john@runner.lab.internal 'sudo install -m 640 -o root -g runner /tmp/kubeconfig /etc/github-runner/kubeconfig && rm /tmp/kubeconfig'
-ssh john@runner.lab.internal 'sudo -u runner KUBECONFIG=/etc/github-runner/kubeconfig kubectl auth whoami && \
-  sudo -u runner KUBECONFIG=/etc/github-runner/kubeconfig kubectl -n containerhelper auth can-i create deployments'
-```
-
-Expect `system:serviceaccount:containerhelper:gha-deployer` and `yes`. The file is readable only by root and the
-`runner` group — job steps run as `runner`, so `KUBECONFIG=/etc/github-runner/kubeconfig` just works.
-
-## 4. Install the runner (you)
+## 4. Register the runners (you)
 
 Facts that shape the install:
 
-- **Scope.** If `denmanjohn-maker` is a personal account, runners are **per repository** — install the runner twice
-  (two directories, two services), once per repo. If it is (or you make it) an **organization**, install **one**
-  runner at org level (Org → Settings → Actions → Runners) and both repos can use it. The org route is closer to
-  work and halves the maintenance; a free org costs nothing.
+- **Scope.** `denmanjohn-maker` is a personal account, so runners are **per repository** — one container per repo
+  (that is what the compose file defines). If you later make an **organization**, one runner at org level serves
+  both repos: keep one service, set `RUNNER_URL=https://github.com/<org>` and take the token from the org's
+  Runners page. The org route is closer to work and halves the maintenance; a free org costs nothing.
 - **Private repos only.** GitHub warns against self-hosted runners on public repos: a fork PR can run arbitrary
-  code on your VM. Keep both repos private, or at minimum never trigger on `pull_request` from forks.
-- **Non-root.** Run as the `runner` user created in §2. `svc.sh install runner` sets that up as a systemd unit.
-- **Version.** 2.338.2 was current on 2026-10-27 — take whatever the GitHub "New self-hosted runner" page shows;
-  the runner self-updates afterwards.
+  code on your runner — and this runner holds the Docker socket. Keep both repos private, or at minimum never
+  trigger on `pull_request` from forks.
+- **Non-root.** Jobs run as `runner` (uid 1001). `group_add: ["0"]` only grants the socket.
+- **Version.** `RUNNER_VERSION` in `lab-env.sh` pins the image tag; the runner self-updates afterwards.
 
-GitHub → repo (or org) → **Settings → Actions → Runners → New self-hosted runner → Linux → ARM64**. It shows
-commands equivalent to these (the token is valid for 1 h):
+GitHub → repo → **Settings → Actions → Runners → New self-hosted runner → Linux → ARM64**. Copy only the
+`--token` value from the page (valid for 1 h):
 
 ```bash
-# on the VM, as the service user
-sudo -iu runner
-RVER=2.338.2
-mkdir -p ~/actions-runner-containerhelper && cd ~/actions-runner-containerhelper
-curl -fL -o runner.tgz "https://github.com/actions/runner/releases/download/v${RVER}/actions-runner-linux-arm64-${RVER}.tar.gz"
-tar -xzf runner.tgz && rm runner.tgz
-# any missing libs (libicu etc.):  sudo ./bin/installdependencies.sh     (run from your sudo user, not 'runner')
-
-./config.sh --unattended \
-  --url    https://github.com/denmanjohn-maker/ContainerHelperAdditions \   # or https://github.com/<org> for org scope
-  --token  <registration token from the page> \
-  --name   runner-containerhelper \
-  --labels k3s-lab,harbor,arm64 \
-  --work   _work
-
-# environment every job inherits (the runner reads .env and .path in its root on start)
-cat > .env <<'EOF'
-KUBECONFIG=/etc/github-runner/kubeconfig
-DOCKER_BUILDKIT=1
-HARBOR_HOST=harbor.lab.internal
-EOF
-exit                                   # back to your sudo user
-
-cd /home/runner/actions-runner-containerhelper
-sudo ./svc.sh install runner && sudo ./svc.sh start && sudo ./svc.sh status
+source lab-env.sh
+umask 077
+echo 'AXXXXXXXXXXXXXXXXXXXXXXXXXXXX' > secrets/runner-token-containerhelper      # from ContainerHelperAdditions
+echo 'AYYYYYYYYYYYYYYYYYYYYYYYYYYYY' > secrets/runner-token-devopshelpers        # from DevOpsHelperTools
+docker compose -f runner/docker-compose.yml up -d --build
+docker compose -f runner/docker-compose.yml logs -f        # "√ Runner successfully added" … "Listening for Jobs"
 ```
 
-Repeat with `~/actions-runner-devopshelpers` / `--url …/DevOpsHelperTools` / `--name runner-devopshelpers` for the
-second repo (personal-account case). The runner appears under the repo's **Runners** tab as *Idle* with labels
-`self-hosted · Linux · ARM64 · k3s-lab · harbor · arm64`.
+Each runner appears under its repo's **Runners** tab as *Idle* with labels
+`self-hosted · Linux · ARM64 · k3s-lab · harbor · arm64`. The entrypoint registers with `--replace`, so re-using
+a runner name after a rebuild is fine.
 
 Day-2:
 
 | Task | Command |
 |---|---|
-| status / logs | `sudo ./svc.sh status` · `journalctl -u 'actions.runner.*' -f` · `_diag/Runner_*.log` |
-| stop / start | `sudo ./svc.sh stop` / `start` |
-| remove | `sudo ./svc.sh uninstall` then `sudo -u runner ./config.sh remove --token <removal token>` |
-| job workspaces | `/home/runner/actions-runner-*/_work/<repo>/<repo>` — safe to delete when stopped |
-| docker disk | `docker system df` · `docker builder prune -af --filter until=168h` (add to cron weekly) |
+| status / logs | `docker compose -f runner/docker-compose.yml ps` · `docker logs -f runner-containerhelper` · `_diag/` inside the volume: `docker exec runner-containerhelper ls _diag` |
+| stop / start | `docker compose -f runner/docker-compose.yml stop` / `up -d` (or `./lab.sh stop` / `up`) |
+| shell | `docker exec -it runner-containerhelper bash` (as `runner`) |
+| remove / re-register | remove the runner in GitHub, then `docker compose -f runner/docker-compose.yml down -v` (drops the home volumes), new token files, `up -d` |
+| job workspaces | `/home/runner/_work/<repo>/<repo>` in the volume — safe to delete when stopped |
+| docker disk | `docker system df` · `./lab.sh prune` (build cache older than 7 days, images older than 14) |
 
 ## 5. Verify end to end
 
@@ -132,8 +108,9 @@ Or run `scripts/verify.sh` from the Mac, which checks the same things from outsi
 ## 6. If you later want to compare with Actions Runner Controller (ARC)
 
 ARC runs ephemeral runner pods in the cluster via a Helm-installed controller and a *runner scale set* registered
-to GitHub (`gha-runner-scale-set-controller` + `gha-runner-scale-set` charts, in a `arc-systems` namespace). It
+to GitHub (`gha-runner-scale-set-controller` + `gha-runner-scale-set` charts, in an `arc-systems` namespace). It
 needs a GitHub App or PAT, and container builds need either Docker-in-Docker (`containerMode: dind`, which PSA
 `restricted` forbids — you'd carve out a namespace at `privileged`) or a Kaniko/BuildKit rootless job pattern.
-That PSA friction and the fact that work runs classic VM runners is why this lab uses a VM. Everything in this
-lab except §4 is unchanged if you add ARC alongside later — same Harbor robots, same deployer SA.
+That PSA friction and the fact that work runs classic long-lived runners is why this lab uses them. Everything in
+this lab except §4 is unchanged if you add ARC alongside later — same Harbor robots, same deployer SA. The base
+image is the same one ARC uses, so the Dockerfile here is a head start.

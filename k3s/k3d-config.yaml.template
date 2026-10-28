@@ -1,0 +1,41 @@
+# k3d cluster definition — rendered by `lab.sh create-cluster` into secrets/k3d-config.yaml
+# (absolute paths), then `k3d cluster create --config`. Schema: https://k3d.io/stable/usage/configfile/
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: ${K3D_CLUSTER}
+servers: ${K3D_SERVERS}
+agents: ${K3D_AGENTS}
+image: ${K3S_IMAGE}                      # pinned K3s minor = work VKS (lab-env.sh)
+network: ${HARBOR_NETWORK}               # Harbor's compose network: nodes reach nginx as ${HARBOR_HOST}
+kubeAPI:
+  hostIP: "127.0.0.1"                    # kubectl on the Mac: https://127.0.0.1:${K8S_API_HOST_PORT}
+  hostPort: "${K8S_API_HOST_PORT}"
+ports:                                   # Traefik via the k3d load balancer (Harbor owns 80/443 on the Mac)
+  - port: ${TRAEFIK_HTTP_PORT}:80
+    nodeFilters: [loadbalancer]
+  - port: ${TRAEFIK_HTTPS_PORT}:443
+    nodeFilters: [loadbalancer]
+volumes:
+  # Lab CA for containerd (referenced as ca_file in registries.yaml) …
+  - volume: "${LAB_CERTS}/ca.crt:/etc/ssl/certs/kubernetes-lab-ca.crt"
+    nodeFilters: ["server:*", "agent:*"]
+  # … and the registries file itself: Harbor auth + docker.io mirrored through the proxy cache.
+  # Bind-mounted, so k3s/10-render-registries.sh updates nodes in place (plus a cluster restart).
+  - volume: "${LAB_SECRETS}/registries.yaml:/etc/rancher/k3s/registries.yaml"
+    nodeFilters: ["server:*", "agent:*"]
+options:
+  k3d:
+    wait: true
+    timeout: "180s"
+  k3s:
+    extraArgs:
+      # Runners reach the API server by container name on the docker network (K8S_API_INTERNAL).
+      - arg: --tls-san=${K3D_SERVER_NODE}
+        nodeFilters: ["server:*"]
+  runtime:
+    serversMemory: ${K3D_SERVER_MEMORY}
+    agentsMemory: ${K3D_AGENT_MEMORY}
+  kubeconfig:
+    updateDefaultKubeconfig: true        # context ${K3D_CONTEXT} in ~/.kube/config
+    switchCurrentContext: true

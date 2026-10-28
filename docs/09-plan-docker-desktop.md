@@ -1,19 +1,20 @@
-# 09 — Plan: replace VMware Fusion with Docker Desktop
+# 09 — Migration: VMware Fusion → Docker Desktop
 
-Status: **proposal** (written 2026-10-28; decision to use Docker Desktop made the same day). Nothing here has been
-executed yet. Phase 0 proves the four things that could still surprise us before anything on Fusion is touched.
+Status (2026-10-28): **Phase 1 (repository) is done** — every script, config and runbook in this repo now
+describes the Docker Desktop lab. **Phases 0 and 2–5 run on the Mac** and are tracked in the checklist in §4.
+Keep this file as the record: tick the boxes and note spike results as you go.
 
 ## 0. Summary
 
-Fusion gives the lab five Ubuntu VMs. Docker Desktop gives the lab one Linux VM with a Docker engine in it, and
-every lab role already has a standard Docker shape:
+Fusion gave the lab five Ubuntu VMs. Docker Desktop gives the lab one Linux VM with a Docker engine in it, and
+every lab role has a standard Docker shape:
 
 ```
   Mac — Docker Desktop (one Linux VM, arm64)                     docker network: harbor_harbor
   ┌──────────────────────────────────────────────────────────────────────────────────────────────────────┐
   │  Harbor 2.16 (arm64)        docker compose stack from the official offline installer                 │
   │     nginx :443 → published on the Mac as 127.0.0.1:443 = harbor.lab.internal (/etc/hosts)            │
-  │     network alias harbor.lab.internal so nodes and the runner reach nginx directly                   │
+  │     network alias harbor.lab.internal so nodes and the runners reach nginx directly                  │
   │                                                                                                      │
   │  k3s-lab                    k3d cluster: 1 server + 2 agents, image rancher/k3s:v1.34.x-k3s1         │
   │     nodes on harbor_harbor; registries.yaml + lab CA mounted at create; Traefik on :8080/:8443       │
@@ -25,162 +26,120 @@ every lab role already has a standard Docker shape:
          GitHub ──► runner (outbound long-poll) ──► docker build/push ──► Harbor ──► k3s pulls ──► kubectl apply
 ```
 
-What stays exactly as it is: Harbor version and configuration, the private lab CA, robot accounts, the Docker Hub
-proxy cache, `registries.yaml` content, namespaces with PSA `restricted`, the `gha-deployer` RBAC and kubeconfig,
-the `harbor-pull` secret, both workflow files, the sample Kustomize overlay, and the `scripts/verify.sh` checks
-(reworded for `docker exec`).
-
-What changes:
-
-| Decision | Fusion lab | After migration |
+| Decision | Fusion lab | Docker Desktop lab |
 |---|---|---|
-| Hypervisor | VMware Fusion, five VMs, vmnet8 NAT | Docker Desktop, one VM, Docker networks |
-| Harbor host | Ubuntu VM, Docker CE, `/opt/harbor`, `/data` | compose stack on the Mac's engine; install dir and data under `~/Lab/harbor` (outside iCloud) |
-| Cluster | K3s on three VMs, external `lab.sh` | **k3d** (K3s nodes as containers), still v1.34, declared in `k3s/k3d-config.yaml` |
-| Runner | Ubuntu VM, `actions-runner` as a systemd service | two containers from `runner/Dockerfile`, Docker socket mounted, persistent `/home/runner` volume |
-| Names | `/etc/hosts` pushed to every VM, DHCP reservations | one `/etc/hosts` line on the Mac; Docker DNS aliases inside the VM |
-| CA trust | OS store on every VM + `/etc/docker/certs.d` | macOS keychain (engine + Mac CLI), `ca_file` in `registries.yaml` (nodes), image-baked CA (runner) |
-| Start after reboot | Fusion auto-start | Docker Desktop at login; every container is `restart: always` / `unless-stopped` |
-| RAM | 20 GB of VM memory | Docker Desktop VM at 10–12 GB |
+| Hypervisor | VMware Fusion, five VMs, vmnet8 NAT | Docker Desktop, one VM, one Docker network |
+| Harbor host | Ubuntu VM, Docker CE, `/opt/harbor`, `/data` | compose stack on the Mac's engine; `~/Lab/harbor/{harbor,data,log}` (outside iCloud) |
+| Cluster | K3s on three VMs, external `lab.sh` | **k3d** (K3s nodes as containers), still v1.34, `k3s/k3d-config.yaml.template` |
+| Runners | Ubuntu VM, `actions-runner` systemd service | two containers from `runner/Dockerfile`, Docker socket mounted, `/home/runner` volume |
+| Names | `/etc/hosts` pushed to every VM, DHCP reservations | one `/etc/hosts` line on the Mac; Docker DNS alias on nginx inside the VM |
+| CA trust | OS store on every VM + `/etc/docker/certs.d` | macOS keychain (engine + Mac), `ca_file` in `registries.yaml` (nodes), image-baked CA (runners) |
+| Start after reboot | Fusion auto-start | Docker Desktop at login; `restart: always` / `unless-stopped` |
+| RAM | 20 GB of VM memory | Docker Desktop VM at 12 GB |
 
-What is given up, stated once: the five "hosts" become containers in one VM. The node-level exercises (SSH into a
-node, `systemctl restart k3s-agent`, `ufw`, Netplan, cloud-init) become `docker exec` into a k3d node or disappear.
-The pipeline, registry, scanning, PSA and RBAC exercises are unchanged. Docker Desktop is free for personal use and
-needs a paid subscription on company machines above 250 employees or $10M revenue.
+Given up, stated once: the five "hosts" became containers in one VM. Node-level exercises (SSH into a node,
+`systemctl restart k3s-agent`, `ufw`, Netplan, cloud-init) are now `docker exec` into a k3d node or gone.
+The pipeline, registry, scanning, PSA and RBAC exercises are unchanged. Docker Desktop is free for personal
+use and needs a paid subscription on company machines above 250 employees or $10M revenue.
 
-## 1. Facts this plan rests on (checked 2026-10-28)
+## 1. Facts the design rests on (checked 2026-10-28)
 
-| Fact | Consequence |
+| Fact | Where it landed |
 |---|---|
-| Docker Desktop on Apple silicon runs an arm64 Linux VM. Memory defaults to half the host; set it under Settings → Resources. Multi-platform builds (amd64) use Rosetta/QEMU built in | Replaces `binfmt` setup on the runner VM. Budget 10–12 GB for the VM |
-| Docker Desktop trusts CAs from the **macOS keychain** (System or login) and needs a restart after the keychain changes (docs/04 §4 already covers this) | The engine's pushes to `harbor.lab.internal` trust the lab CA with no `/etc/docker/certs.d` |
-| Default file sharing covers `/Users`, `/Volumes`, `/private`, `/tmp`, `/var/folders`. `/var/log` is **not** shared, and `/var` resolves through `/private/var` | Harbor's `log.local.location` (default `/var/log/harbor`) and `data_volume` (default `/data`) must be moved under `$HOME`; keep them **out of iCloud Drive** (the repo lives in `~/Library/Mobile Documents/…`; registry blobs must not sync) |
-| Harbor's compose file (generated by `prepare`) defines network `harbor` (becomes `harbor_harbor` for a project dir named `harbor`), service `proxy` with `container_name: nginx` publishing `80:8080` and `443:8443`, a `log` service that the others reach at `tcp://localhost:1514` (published `127.0.0.1:1514:10514`), all services `restart: always`. Everything persistent lives under `data_volume` | Attach k3d nodes and the runner to `harbor_harbor`; give `proxy` the alias `harbor.lab.internal` through a `docker-compose.override.yml` (compose merges it automatically, and `prepare` does not touch it). The syslog-on-localhost pattern is the one known Docker-Desktop sensitivity → spike S1 |
-| Harbor 2.16.0-rc1 offline installer ships arm64 images; `install.sh` only needs `docker` + `docker compose` and runs `prepare` as a container with the install dir bind-mounted | `30-install-harbor.sh` runs on the Mac with `sudo` removed, `md5sum` → `md5 -q`, paths under `~/Lab/harbor` |
-| **k3d v5.9.0** (2026-06-02): config `k3d.io/v1alpha5`, `image:` pins the K3s tag, `network:` joins an existing Docker network, `volumes:` with `nodeFilters` mounts files into nodes, `registries.config:` embeds `registries.yaml`, `options.k3s.extraArgs` with `nodeFilters` passes server/agent flags, `ports:` maps the load balancer. k3d's own docs show the private-registry-with-CA pattern: mount the CA, reference it as `ca_file`. Node containers restart with Docker (`unless-stopped`) | The whole cluster is one YAML file in the repo. `k3s/10-trust-harbor-ca.sh` shrinks to "render `registries.yaml` from the template"; k3d mounts it at create. Rotating the robot token = re-render + `docker cp` + `docker restart` of the three nodes, or `k3d cluster delete/create` (90 s) |
-| K3s v1.34 images exist as `rancher/k3s:v1.34.<p>-k3s1` (the Fusion lab already runs that minor) | Version match with work VKS is kept; k3d's own default would be newer, so **always set `image:`** |
-| Official runner image `ghcr.io/actions/actions-runner:<ver>` (Ubuntu 24.04 base, user `runner` uid 1001 in groups `sudo` and `docker` gid 123, Docker CLI + buildx included, **no compose**, no entrypoint, runner unpacked in `/home/runner`) | `runner/Dockerfile` adds kubectl/kustomize/helm/yq/trivy/shellcheck/k9s and the lab CA, plus a small entrypoint that runs `config.sh` once (skips if `.runner` exists) and then `run.sh`. Compose service per repo for a personal account; one service at org scope |
-| Docker socket mounted into a container: inside the container the socket is owned by `root` and whatever gid the VM uses, not the image's gid 123 | Spike S4: either `group-add` the socket's gid in compose or run the runner service as root. Same trust posture as the old VM (anything with the socket is root on the Docker VM) |
-| Ports: Harbor owns 80/443 on the Mac. k3d's load balancer (Traefik) must therefore publish elsewhere | Traefik on `8080:80@loadbalancer` and `8443:443@loadbalancer`; API server on `127.0.0.1:6443` |
-| Docker Desktop's VM resolver forwards to the macOS resolver, which honours `/etc/hosts`; published ports are bound inside the VM as well, which is why `docker push localhost:5000/…` works on Docker Desktop | `127.0.0.1 harbor.lab.internal` on the Mac serves both the Mac CLI and the engine's pushes → spike S2 confirms it for a TLS hostname |
+| Docker Desktop trusts CAs from the **macOS keychain** and rebuilds the engine's bundle on restart | docs/03 §1, docs/04 §3, `20-gen-certs.sh` "Next" |
+| Default file sharing covers `/Users`, not `/var/log`; `/var` resolves through `/private/var` | `HARBOR_HOME` default `~/Lab/harbor`; `log.local.location` and `data_volume` patched there by `30-install-harbor.sh` |
+| Harbor's compose file: network `harbor` → `harbor_harbor`, service `proxy` = container `nginx` on `80:8080`/`443:8443`, `log` service reached at `127.0.0.1:1514`, all `restart: always` | `HARBOR_NETWORK`, `harbor/docker-compose.override.yml.template` (aliases + `json-file` fallback) |
+| Harbor 2.16.0-rc1 arm64 offline installer; `install.sh` needs only `docker` + `docker compose` | `30-install-harbor.sh` runs on the Mac (no `sudo`, `openssl` md5, python patcher validated against the real `harbor.yml.tmpl`) |
+| **k3d 5.9.0**, config `k3d.io/v1alpha5`: `image`, `network`, `volumes` with `nodeFilters`, `kubeAPI.hostIP/hostPort`, `ports`, `options.k3s.extraArgs`, `options.runtime.serversMemory/agentsMemory`; nodes restart with Docker | `k3s/k3d-config.yaml.template` (validated against k3d's JSON schema) |
+| K3s v1.34 images: `rancher/k3s:v1.34.12-k3s1` is current | `K3S_IMAGE` in `lab-env.sh` |
+| `ghcr.io/actions/actions-runner:2.338.2`: Ubuntu 24.04, user `runner` uid 1001, Docker CLI + buildx, no compose, no entrypoint | `runner/Dockerfile`, `runner/entrypoint.sh` |
+| Docker socket inside containers on Docker Desktop is `root:root`; `group_add: ["0"]` is the usual fix | `runner/docker-compose.yml` |
+| Harbor owns 80/443 on the Mac | Traefik on 8080/8443 (`TRAEFIK_*_PORT`), API on 127.0.0.1:6443 |
+| Docker Desktop's VM resolver honours the Mac's `/etc/hosts` and published ports are bound inside the VM (why `docker push localhost:5000/…` works there) | `127.0.0.1 harbor.lab.internal` serves the Mac CLI and the engine; cert SAN includes `127.0.0.1` |
 
-## 2. Phase 0 spikes (do on the Mac while Fusion keeps running)
+## 2. Phase 0 spikes — prove these on the Mac before cutting over
 
-| # | Spike | Pass criterion | If it fails |
-|---|---|---|---|
-| S1 | **Harbor compose on Docker Desktop.** Download the arm64 offline installer to `~/Lab/harbor`, render `harbor.yml` with `data_volume: ~/Lab/harbor/data`, `log.local.location: ~/Lab/harbor/log`, certs from `secrets/certs`, run `./install.sh --with-trivy` | `curl -fsS https://harbor.lab.internal/api/v2.0/health` healthy; `docker compose ps` shows `nginx`, `log`, `core` healthy; a scan completes | Logging: switch `log` to the `json-file` driver via the override file. File sharing: add `~/Lab` under Settings → Resources → File sharing. Port 443 busy: nothing else on the Mac may own it |
-| S2 | **Engine push by hostname.** `/etc/hosts` → `127.0.0.1 harbor.lab.internal`; CA in keychain; restart Docker Desktop; `docker login` + `docker push harbor.lab.internal/lab/alpine:test` from the Mac | Push succeeds over TLS, image visible in the UI | Use the Mac's LAN IP instead of `127.0.0.1` in `/etc/hosts` (changes with network) or add `harbor.lab.internal` as a second alias resolvable from the VM; last resort `host.docker.internal` plus a cert SAN |
-| S3 | **k3d node pulls through Harbor.** `k3d cluster create` from the draft `k3s/k3d-config.yaml` (network `harbor_harbor`, CA + `registries.yaml` mounted); `docker exec k3d-k3s-lab-server-0 crictl pull harbor.lab.internal/dockerhub/library/alpine:3.20` | Pull succeeds; `kubectl get nodes` 3× Ready; a PSA-restricted pod from `workflows/sample-deploy` runs | Check the alias on `nginx` (`docker inspect nginx`), the `ca_file` path inside the node, `hosts.toml` under `/var/lib/rancher/k3s/agent/etc/containerd/certs.d/` |
-| S4 | **Runner container.** Build `runner/Dockerfile`, start one service with the socket and a kubeconfig mounted, register against one repo, run the `runner-smoke` workflow from docs/05 §5 | Workflow green: `docker version`, `kubectl get nodes` (via `k3d-k3s-lab-server-0:6443`), `curl` to Harbor health | Socket gid: add `group_add: ["<gid>"]` or `user: root`. API SAN: add `--tls-san=k3d-k3s-lab-server-0` under `options.k3s.extraArgs` |
+Fusion keeps running while you do them. Each is 30–60 min. Record the result here.
 
-Decision gate: S1–S3 must pass; S4 may slip into Phase 4 because the runner is the last thing cut over.
+| # | Spike | Pass criterion | Result | If it fails |
+|---|---|---|---|---|
+| S1 | **Harbor compose on Docker Desktop.** `harbor/20-gen-certs.sh`, keychain + restart, `scripts/hosts-entry.sh --apply`, `harbor/30-install-harbor.sh` (fresh `HARBOR_HOME`) | `curl --cacert secrets/certs/ca.crt https://harbor.lab.internal/api/v2.0/health` healthy; `docker compose … ps` shows `nginx`, `log`, `core` up; a scan completes | ☐ | logging: uncomment the `json-file` fallback in the override template; file sharing: add `~/Lab`; port 443 busy: `sudo lsof -iTCP:443` |
+| S2 | **Engine push by hostname.** docs/03 §5 smoke test | `docker push harbor.lab.internal/lab/alpine:test` succeeds over TLS from the Mac | ☐ | use the Mac's LAN IP in `/etc/hosts` (changes with network), or add a `host.docker.internal` SAN and name |
+| S3 | **k3d node pulls through Harbor.** `harbor/40-init-harbor.sh` (on the spike Harbor), `k3s/10-render-registries.sh`, `./lab.sh create-cluster`, `docker exec k3d-k3s-lab-server-0 k3s crictl pull harbor.lab.internal/dockerhub/library/alpine:3.20` | pull succeeds; 3 nodes Ready; a PSA-restricted pod from `workflows/sample-deploy` runs | ☐ | alias on nginx (`docker inspect nginx`), `ca_file` path in the node, `hosts.toml` (docs/08 §2) |
+| S4 | **Runner container.** docs/05 §4 with one repo, run the `runner-smoke` workflow | green: `docker version`, `kubectl get nodes` via `k3d-k3s-lab-server-0:6443`, `curl` to Harbor | ☐ | socket gid (docs/08 §3); API SAN already set by the k3d template |
 
-## 3. Repository changes (Phase 1)
+Decision gate: S1–S3 must pass; S4 may slip into Phase 4.
 
-### 3.1 New files
-
-| File | Purpose |
-|---|---|
-| `lab.sh` | `up` (check Docker Desktop is running → `docker compose up -d` in the Harbor dir → wait for health → `k3d cluster start k3s-lab` → `docker compose up -d` for runners), `stop` (reverse), `status`, `create-cluster` / `destroy-cluster` (k3d), `shell <node>` (`docker exec -it`). Replaces the external `~/Virtual Machines.localized/k3s-lab/lab.sh` and the Fusion power-on steps |
-| `k3s/k3d-config.yaml` | `servers: 1`, `agents: 2`, `image: rancher/k3s:v1.34.<p>-k3s1`, `network: harbor_harbor`, `kubeAPI.hostIP: 127.0.0.1 / hostPort: 6443`, `ports: 8080:80@loadbalancer, 8443:443@loadbalancer`, `volumes:` CA → `/etc/ssl/certs/kubernetes-lab-ca.crt` on all nodes, `registries.config:` rendered from the existing template, `options.k3s.extraArgs: --tls-san=k3d-k3s-lab-server-0` on servers. Memory per node via `options.runtime.serversMemory/agentsMemory` (`1.5g` / `1g`) |
-| `harbor/docker-compose.override.yml` | `services.proxy.networks.harbor.aliases: [harbor.lab.internal, harbor]`; optional `log` logging-driver change if S1 needs it. Copied into the Harbor install dir by `30-install-harbor.sh` |
-| `runner/Dockerfile` | `FROM ghcr.io/actions/actions-runner:${RUNNER_VERSION}`; adds kubectl (v1.34.x), kustomize, helm, yq, jq, trivy, shellcheck, k9s; installs the lab CA into the OS store (build arg, from `secrets/certs/ca.crt`); `ENTRYPOINT ["/entrypoint.sh"]` |
-| `runner/entrypoint.sh` | If `/home/runner/.runner` is missing: `./config.sh --unattended --url $RUNNER_URL --token $RUNNER_TOKEN --name $RUNNER_NAME --labels k3s-lab,harbor,arm64 --work _work`; then `exec ./run.sh`. The token is read once from a file in `secrets/` and never baked into the image |
-| `runner/docker-compose.yml` | Services `runner-containerhelper` and `runner-devopshelpers` (one `runner` at org scope later), `restart: unless-stopped`, `networks: [harbor_harbor]` (external), volumes: `/var/run/docker.sock`, `secrets/kubeconfig-gha-deployer.yaml:/etc/github-runner/kubeconfig:ro`, named volume per service for `/home/runner` (keeps registration, `_work`, build context across restarts); env `KUBECONFIG`, `DOCKER_BUILDKIT=1`, `HARBOR_HOST` |
-| `scripts/hosts-entry.sh` | Writes/updates the single Mac line `127.0.0.1 harbor.lab.internal harbor` inside the existing `# >>> kubernetes-lab >>>` block |
-
-### 3.2 Edited files
+## 3. Phase 1 — repository changes (done)
 
 | File | Change |
 |---|---|
-| `lab-env.sh` | Remove `HARBOR_IP`, `RUNNER_IP`, `K3S_SERVER_IP`, `K3S_AGENT_IPS`, `K3S_SSH_USER`, `VM_SSH_USER`. Add `HARBOR_HOME="$HOME/Lab/harbor"` (install dir, `data/`, `log/`, must not be under iCloud), `K3D_CLUSTER="k3s-lab"`, `K3S_IMAGE="rancher/k3s:v1.34.<p>-k3s1"`, `K3D_VERSION="5.9.0"`, `TRAEFIK_HTTP_PORT=8080`, `TRAEFIK_HTTPS_PORT=8443`, `K8S_API_INTERNAL="https://k3d-${K3D_CLUSTER}-server-0:6443"`. Keep every Harbor/K8s layout variable. Add helper `lab_node_exec <node> <cmd>` (`docker exec`) |
-| `harbor/20-gen-certs.sh` | SANs: `harbor.lab.internal`, `harbor`, `nginx`, `127.0.0.1`. Drop the Fusion IP SAN. Existing certs stay valid for the hostname; regenerate once with `--renew` so `127.0.0.1` is covered for the Mac-side push |
-| `harbor/30-install-harbor.sh` | Runs on the Mac: no `sudo`, `INSTALL_DIR=$HARBOR_HOME/harbor`, certs copied to `$HARBOR_HOME/certs`, `md5 -q`, `harbor.yml` patched with `data_volume` and `log.local.location` under `$HARBOR_HOME`, copies the override file in, same `prepare`/`install.sh --with-trivy` and health poll. Re-run = reconfigure, as today |
-| `harbor/40-init-harbor.sh` | Unchanged (talks to the API on `https://harbor.lab.internal`) |
-| `harbor/00-push-to-vm.sh`, `harbor/10-bootstrap-vm.sh` | **Delete** (no VM to push to or bootstrap) |
-| `k3s/10-trust-harbor-ca.sh` | Becomes `k3s/10-render-registries.sh`: renders `registries.yaml` from the template into `k3s/registries.yaml` (git-ignored, contains the robot token) for `k3d-config.yaml` to embed, and if the cluster already exists, `docker cp` + `docker restart` on each node |
-| `k3s/registries.yaml.template` | `ca_file` path becomes `/etc/ssl/certs/kubernetes-lab-ca.crt` (where k3d mounts it). Mirrors unchanged |
-| `k3s/40-make-kubeconfig.sh` | `server:` set to `$K8S_API_INTERNAL` for the runner's copy (the Mac copy is written by `k3d kubeconfig merge`); cluster CA pulled from the k3d-generated kubeconfig |
-| `k3s/20-namespaces.yaml`, `k3s/30-deployer-rbac.yaml`, `k3s/50-pull-secrets.sh` | Unchanged |
-| `runner/10-prep-runner-vm.sh` | **Delete** (replaced by `runner/Dockerfile`) |
-| `scripts/hosts-entries.sh` | **Delete** (replaced by `scripts/hosts-entry.sh`) |
-| `scripts/verify.sh` | Replace `ssh` checks: `docker exec k3d-…` for node checks, `docker compose ps` for Harbor and runners, `docker exec runner-… kubectl auth can-i`, `docker inspect nginx` alias check, Docker Desktop running check |
-| `workflows/*.yml` | Unchanged. (`runs-on: [self-hosted, k3s-lab]`, `KUBECONFIG` from the runner env, push to `harbor.lab.internal/…`) |
-| `README.md`, `docs/01`–`08` | §6 doc map |
+| `lab-env.sh` | IPs and SSH users removed; `HARBOR_HOME`, k3d sizing/ports, `K3S_IMAGE`, `K3D_VERSION`, `RUNNER_VERSION`; derived `HARBOR_NETWORK`, `K3D_CONTEXT`, `K8S_API_INTERNAL`; helpers `lab_docker_ok`, `k3d_nodes`, `lab_node_exec`, `lab_render` |
+| `lab.sh` (new) | `up` / `stop` / `status` / `create-cluster` / `destroy-cluster` / `shell` / `prune` |
+| `k3s/k3d-config.yaml.template` (new) | the cluster: image, Harbor network, API on 127.0.0.1:6443, Traefik 8080/8443, CA + registries mounts, `--tls-san`, memory caps |
+| `k3s/10-render-registries.sh` (replaces `10-trust-harbor-ca.sh`) | renders `secrets/registries.yaml`; restarts the cluster if it is running |
+| `k3s/registries.yaml.template` | `ca_file` → `/etc/ssl/certs/kubernetes-lab-ca.crt` (the k3d mount) |
+| `k3s/40-make-kubeconfig.sh` | server = `https://k3d-k3s-lab-server-0:6443`, k3d context, in-network verification |
+| `harbor/20-gen-certs.sh` | SANs: hostname, `harbor`, `nginx`, `localhost`, `127.0.0.1`; no IP from Fusion |
+| `harbor/30-install-harbor.sh` | runs on the Mac: `HARBOR_HOME` layout, passwords generated here, python `harbor.yml` patcher, override file, `compose stop/up` reconfigure |
+| `harbor/docker-compose.override.yml.template` (new) | aliases `harbor.lab.internal`, `harbor` on `proxy`; commented `json-file` logging fallback |
+| `harbor/40-init-harbor.sh` | hints only |
+| `runner/Dockerfile`, `runner/entrypoint.sh`, `runner/docker-compose.yml` (new) | the two runner containers |
+| `scripts/hosts-entry.sh` (replaces `hosts-entries.sh`) | one line, Mac only |
+| `scripts/verify.sh` | Docker Desktop, alias, k3d nodes via `docker exec`, runner containers |
+| deleted | `harbor/00-push-to-vm.sh`, `harbor/10-bootstrap-vm.sh`, `runner/10-prep-runner-vm.sh`, `scripts/hosts-entries.sh`, `k3s/10-trust-harbor-ca.sh` |
+| docs | README, 01–08 rewritten for the Docker shape (`03-harbor-vm.md` → `03-harbor.md`); workflows unchanged |
 
-## 4. Cutover sequence
+Validated in the session that produced it: `shellcheck -S warning -x` on every script; the k3d template rendered
+and checked against k3d's `v1alpha5` JSON schema; `docker compose config` on `runner/docker-compose.yml`; the
+compose override merged against a Harbor-shaped base file; the `harbor.yml` patcher run against the real
+`v2.16.0-rc1` template. Not validated: anything that needs a Mac, Docker Desktop or GitHub — that is Phase 0.
 
-| Phase | Steps | Done when |
-|---|---|---|
-| **0 Prepare** (no lab impact) | Install Docker Desktop (current 4.x), Settings → Resources: 12 GB / 6 CPU, file sharing includes `~/Lab`; `brew install k3d` (5.9.x); CA into the System keychain + Docker Desktop restart; `/etc/hosts` line; **Harbor backup from the Fusion VM** per docs/07 §3 (`harbor-backup-<date>.tgz` → `~/Lab/harbor/`); copy of `secrets/`; run S1–S4 | Gate passed; backup on the Mac |
-| **1 Repo** | §3 changes on a branch; `shellcheck` all scripts; `docker compose config` on both compose files; `k3d cluster create --config k3s/k3d-config.yaml --dry-run`-style validation by creating and deleting a throwaway cluster name | PR merged |
-| **2 Harbor** | Fusion Harbor VM: `docker compose down` (frozen, not deleted). On the Mac: `30-install-harbor.sh` once to lay down the install dir, then restore `data/` from the backup tarball (`tar -xzf … data` into `$HARBOR_HOME`), `harbor.yml` re-rendered (paths differ from the VM, so do not restore the VM's copy), `30-install-harbor.sh` again to bring it up against the restored data. `40-init-harbor.sh` is not needed — projects, robots and the proxy cache come back with the database | Health OK; existing images and robots listed; `docker pull harbor.lab.internal/dockerhub/library/alpine:3.20` works from the Mac |
-| **3 Cluster** | `k3s/10-render-registries.sh`; `lab.sh create-cluster`; `kubectl config use-context k3d-k3s-lab`; `kubectl apply -f k3s/20-namespaces.yaml -f k3s/30-deployer-rbac.yaml`; `k3s/50-pull-secrets.sh`; `k3s/40-make-kubeconfig.sh`; apply `workflows/sample-deploy/overlays/lab` by hand | 3 nodes Ready, `crictl pull` via Harbor, sample app Running under PSA restricted, reachable via Traefik on `:8080` |
-| **4 Runner** | `docker compose -f runner/docker-compose.yml build`; **remove the old runners** in GitHub (Settings → Actions → Runners); put a fresh registration token in `secrets/runner-token-<repo>`; `docker compose up -d`; confirm *Idle* with labels `self-hosted · Linux · ARM64 · k3s-lab · harbor · arm64`; run `runner-smoke`, then a real `main` push through both workflows | Both pipelines green end to end; `scripts/verify.sh` all PASS |
-| **5 Decommission Fusion** | Power off all Fusion VMs; archive `~/Virtual Machines.localized/{k3s-lab,harbor,runner}` to an external disk, delete after two clean weeks; uninstall Fusion (Trash the app, then `/Library/Preferences/VMware Fusion`, `/Library/Application Support/VMware`, `~/Library/Application Support/VMware Fusion`, `~/Library/Preferences/com.vmware.fusion*`, `~/Library/Caches/com.vmware.fusion`); remove the VM IP lines from the Mac's `/etc/hosts` block (the new `hosts-entry.sh` rewrites it); delete the old `lab.sh` folder | Docker Desktop is the only hypervisor; docs updated |
+## 4. Cutover checklist (Mac)
 
-Rollback before Phase 5: `lab.sh stop`, power on the Fusion VMs, restore the old `/etc/hosts` block from git history.
-Harbor data cannot diverge because the Fusion Harbor is frozen at the backup point; if images were pushed to the new
-Harbor after cutover, back up `~/Lab/harbor/data` first (same `tar`, no SSH needed).
+**Phase 0 — prepare (no lab impact)**
+- [ ] Docker Desktop installed; Settings → Resources: 12 GB / 6 CPU; file sharing includes `/Users` (default)
+- [ ] `brew install k3d kubectl derailed/k9s/k9s jq`
+- [ ] `source lab-env.sh`; review `HARBOR_HOME`, `K3S_IMAGE`, `RUNNER_VERSION`
+- [ ] **Harbor backup from the Fusion VM** per the old procedure (`docker compose down` on the VM, `tar … data opt/harbor/harbor.yml`, `scp` to `~/Backups/kubernetes-lab/`)
+- [ ] copy of `secrets/` somewhere safe
+- [ ] spikes S1–S4 (§2) — they double as the first real install; keep the spike Harbor if S1 passes
 
-## 5. Operations after migration (what docs/07 will say)
+**Phase 2 — Harbor**
+- [ ] Fusion Harbor VM: `cd /opt/harbor && sudo docker compose down` (frozen, not deleted)
+- [ ] `docker compose --project-directory ~/Lab/harbor/harbor stop`; `rm -rf ~/Lab/harbor/data`; `tar -C ~/Lab/harbor -xzf ~/Backups/kubernetes-lab/harbor-backup-<date>.tgz data` (restores projects, robots, proxy cache, images); `./harbor/30-install-harbor.sh` again (docs/07 §3)
+- [ ] skip `40-init-harbor.sh`; confirm existing images and robots in the UI; `docker pull harbor.lab.internal/dockerhub/library/alpine:3.20`
 
-| Topic | New answer |
-|---|---|
-| Start / stop | Docker Desktop at login brings Harbor (`restart: always`), k3d nodes (`unless-stopped`) and runners back by itself. `lab.sh up` is for after a `lab.sh stop` and enforces the order Harbor → cluster → runners |
-| Low-memory mode | `docker compose -f runner/docker-compose.yml stop` (queued jobs wait, runner shows *Offline*); or `k3d cluster stop k3s-lab` when only Harbor work is needed |
-| Cluster rebuild | `lab.sh destroy-cluster && lab.sh create-cluster` then docs/02 §3 — about 2 minutes instead of 10; Harbor keeps every image |
-| Harbor backup | `docker compose down` in `$HARBOR_HOME/harbor`, `tar -czf ~/Backups/kubernetes-lab/harbor-backup-$(date +%F).tgz -C $HARBOR_HOME data harbor/harbor.yml`, `up -d`. Same procedure as today without `ssh`/`scp` |
-| Harbor upgrade | Same as docs/07 §4 with `$HARBOR_HOME/harbor` in place of `/opt/harbor` |
-| K3s upgrade | Change `K3S_IMAGE` and recreate the cluster (k3d has no in-place node upgrade). Patch bumps within v1.34 only |
-| Disk | Docker Desktop's VM disk grows; `docker system df`, `docker builder prune`, `docker image prune` on the Mac. Harbor GC + retention unchanged. Registry blobs live on the Mac filesystem under `~/Lab/harbor/data` |
-| Secrets | Same inventory as docs/07 §6, plus `runner-token-<repo>` (one-hour registration tokens; delete after use). The runner's long-lived credential lives in the `/home/runner` named volume |
-| Weekly cron on the runner | Becomes a `docker builder prune -af --filter until=168h` in `lab.sh prune`, run from the Mac |
+**Phase 3 — cluster**
+- [ ] `./k3s/10-render-registries.sh`; `./lab.sh create-cluster`
+- [ ] `kubectl apply -f k3s/20-namespaces.yaml -f k3s/30-deployer-rbac.yaml`; `./k3s/50-pull-secrets.sh`; `./k3s/40-make-kubeconfig.sh`
+- [ ] `kubectl apply -k workflows/sample-deploy/overlays/lab` → Running under PSA restricted; reachable via Traefik on `:8080`
 
-## 6. Documentation map
+**Phase 4 — runners**
+- [ ] remove the old VM runners in GitHub (Settings → Actions → Runners, both repos)
+- [ ] fresh tokens → `secrets/runner-token-containerhelper`, `secrets/runner-token-devopshelpers`
+- [ ] `docker compose -f runner/docker-compose.yml up -d --build`; both *Idle* with labels `k3s-lab · harbor · arm64`
+- [ ] `runner-smoke`, then a real `main` push through both workflows; `./scripts/verify.sh` all PASS
 
-| Doc | Edits |
-|---|---|
-| `README.md` | Header diagram and "Fusion" wording, decision table rows for hypervisor and runner, quick-start table (rows 1, 3, 4, 8, 9 collapse into `lab.sh`/compose commands), sizing paragraph (12 GB VM), folder layout |
-| `docs/01-architecture.md` | Components table (one host column: "container on Docker Desktop"); Networking rewritten around `harbor_harbor`, the `nginx` alias, published ports (443, 6443, 8080/8443) and the single `/etc/hosts` line; trust model adds keychain and image-baked CA; credential flow unchanged |
-| `docs/02-cluster-k3s.md` | §1 becomes `lab.sh create-cluster` + `k3d kubeconfig`; §3 table points at `10-render-registries.sh`; §5 budget per node container; §6 rebuild via k3d |
-| `docs/03-harbor-vm.md` → `03-harbor.md` | Drop §2 (VM creation, IP fixing) and §3 (push/bootstrap); §4 paths under `$HARBOR_HOME`; §7 add Docker Desktop file-sharing and the override file |
-| `docs/04-trust-harbor-ca.md` | §1 nodes: mounted by k3d; §2 runner: baked into the image; §4 Docker Desktop keychain becomes the main path, not an option |
-| `docs/05-github-runner.md` | §1–3 replaced by `runner/Dockerfile` + compose; §4 install steps become "put the token in `secrets/`, `docker compose up -d`"; day-2 table in `docker compose` terms; §6 ARC note stays |
-| `docs/06-deploy-workflows.md` | Unchanged except the note that `driver: docker` buildx is the one that sees the keychain CA |
-| `docs/07-operations.md` | Replace with §5 above |
-| `docs/08-troubleshooting.md` | §1 Harbor adds: mounts denied (file sharing), `log` container unhealthy (syslog on localhost), port 443 in use; §2 nodes: `docker exec … crictl`, alias missing on `nginx`; §3 runner: socket permission denied (gid), `.runner` exists but runner removed on GitHub (delete the file in the volume and restart); §4 "Networking / Fusion" → "Networking / Docker Desktop" (`host.docker.internal`, `/etc/hosts` line, Docker Desktop not started) |
-| `docs/09` (this) | Fill in spike results; becomes the record of the migration |
+**Phase 5 — decommission Fusion**
+- [ ] power off all Fusion VMs; archive `~/Virtual Machines.localized/{k3s-lab,harbor,runner}` to an external disk; delete after two clean weeks
+- [ ] uninstall Fusion: Trash the app, then `/Library/Preferences/VMware Fusion`, `/Library/Application Support/VMware`, `~/Library/Application Support/VMware Fusion`, `~/Library/Preferences/com.vmware.fusion*`, `~/Library/Caches/com.vmware.fusion`
+- [ ] `./scripts/hosts-entry.sh --apply` (rewrites the `# >>> kubernetes-lab >>>` block, dropping the VM IP lines)
+- [ ] delete the old `~/Virtual Machines.localized/k3s-lab/lab.sh` folder; remove the Fusion `dhcpd.conf` host blocks if Fusion is kept for anything else
 
-## 7. Resource budget
+Rollback before Phase 5: `./lab.sh stop`, power on the Fusion VMs, restore the old `/etc/hosts` block from git
+history (`git show 38abbcf:scripts/hosts-entries.sh`). The Fusion Harbor is frozen at the backup point, so Harbor
+data cannot diverge; if images were pushed to the new Harbor after cutover, back up `~/Lab/harbor/data` first.
 
-| Component | RAM (steady) | Notes |
-|---|---|---|
-| Harbor (10 containers, Trivy idle) | ~2.5 GB | Trivy scans spike by ~1 GB |
-| k3d server + 2 agents | ~3 GB | `serversMemory: 1.5g`, `agentsMemory: 1g` as soft caps |
-| two runners idle | ~0.3 GB | a .NET build inside a job adds 2–3 GB while it runs |
-| Docker Desktop VM setting | **12 GB** | 6 CPUs; leaves 12 GB for macOS and tools. 10 GB works if you run one build at a time |
+## 5. Alternatives considered
 
-## 8. Alternatives considered
-
-- **Apple `container` (Containerization framework), machines mode.** Investigated first; the previous revision of
-  this document holds the detail. It would have kept the five-VM shape, but at the cost of a monolithic guest kernel
-  (no VXLAN, no `br_netfilter`), no static IPs, no restart policy, an experimental cluster command, and seven spikes
-  before cutover. Dropped in favour of the well-trodden Docker path on 2026-10-28.
+- **Apple `container` (Containerization framework), machines mode.** Investigated first (git history of this
+  file, commit "Add migration plan"). It would have kept the five-VM shape, at the cost of a monolithic guest
+  kernel (no VXLAN, no `br_netfilter`), no static IPs, no restart policy, an experimental cluster command, and seven
+  spikes before cutover. Dropped in favour of the well-trodden Docker path on 2026-10-28.
 - **Docker Desktop's built-in Kubernetes (kind).** Multi-node is supported in current releases, but it is kubeadm,
   not K3s, and the version is chosen by Docker Desktop. k3d keeps the v1.34 match with work VKS and the
-  `registries.yaml` plumbing, so k3d wins.
+  `registries.yaml` plumbing.
 - **Harbor in-cluster via Helm.** Rejected for the same reason as before: the registry must survive cluster rebuilds.
 - **OrbStack.** Would carry the VM-style scripts over almost unchanged, but adds a second commercial tool when Docker
   Desktop already covers the need.
-
-## 9. Open questions to settle in Phase 0
-
-1. Does Harbor's `log` service work with its `tcp://localhost:1514` syslog target on Docker Desktop, or does the
-   override need to switch services to `json-file` logging? (S1)
-2. Does the engine resolve `harbor.lab.internal` through the Mac's `/etc/hosts` and reach the published 443 at
-   `127.0.0.1`? (S2) If not, the fallback is a cert SAN for `host.docker.internal`.
-3. What gid does the Docker socket carry inside a container on Docker Desktop, and is `group_add` enough for the
-   `runner` user? (S4)
-4. Exact current tags: latest `rancher/k3s:v1.34.<p>-k3s1`, `ghcr.io/actions/actions-runner:2.338.x`, Docker
-   Desktop 4.x. Pin them in `lab-env.sh` on the day.

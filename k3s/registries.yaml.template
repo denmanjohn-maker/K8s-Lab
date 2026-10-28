@@ -1,6 +1,6 @@
-# /etc/rancher/k3s/registries.yaml — rendered by k3s/10-trust-harbor-ca.sh, one copy per node.
-# K3s turns this into containerd hosts.toml under /var/lib/rancher/k3s/agent/etc/containerd/certs.d/.
-# Docs: https://docs.k3s.io/installation/private-registry
+# /etc/rancher/k3s/registries.yaml — rendered by k3s/10-render-registries.sh to secrets/registries.yaml
+# and bind-mounted into every k3d node. K3s turns it into containerd hosts.toml under
+# /var/lib/rancher/k3s/agent/etc/containerd/certs.d/.   Docs: https://docs.k3s.io/installation/private-registry
 mirrors:
   "${HARBOR_HOST}":
     endpoint:
@@ -12,4 +12,4 @@ configs:
       username: "${ROBOT_USER}"
       password: "${ROBOT_TOKEN}"
     tls:
-      ca_file: /etc/rancher/k3s/kubernetes-lab-ca.crt
+      ca_file: /etc/ssl/certs/kubernetes-lab-ca.crt   # mounted by k3s/k3d-config.yaml.template
