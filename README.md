@@ -49,7 +49,7 @@ Kubernetes Lab/
 │   ├── 06-deploy-workflows.md← build→Harbor→k3s pipelines for both repos
 │   ├── 07-operations.md      ← start/stop order, backup, upgrades, GC
 │   ├── 08-troubleshooting.md ← symptoms → fixes
-│   └── 09-plan-apple-containerization.md ← PROPOSAL: replace VMware Fusion with Apple's `container` machines
+│   └── 09-plan-docker-desktop.md ← PROPOSAL: replace VMware Fusion with Docker Desktop (Harbor compose, k3d, runner container)
 ├── harbor/
 │   ├── 00-push-to-vm.sh      ← Mac: generate admin/db passwords once, rsync harbor/ + certs to the VM
 │   ├── 10-bootstrap-vm.sh    ← ON the Harbor VM: docker + compose, CA trust, ufw, /data
