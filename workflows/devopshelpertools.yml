@@ -1,0 +1,160 @@
+# Copy to  DevOpsHelperTools/.github/workflows/lab-build-deploy.yml
+#
+# Pipeline on the on-prem runner:  lint → build (buildx, arm64) → push to Harbor → Harbor/Trivy scan gate → deploy to k3s
+# Repo secrets required:  HARBOR_ROBOT_USER  (robot$gha-push)   HARBOR_ROBOT_TOKEN
+# Repo variables (optional overrides): HARBOR_HOST, HARBOR_PROJECT, IMAGE_NAME, DOCKERFILE, KUSTOMIZE_DIR, K8S_NAMESPACE
+#
+# Adjust the four paths in `env` to the repo's layout. Steps skip cleanly when a path doesn't exist, so this
+# file works from day one and grows with the repo.
+name: lab-build-deploy
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      deploy:
+        description: "Deploy to k3s-lab after build"
+        type: boolean
+        default: true
+
+concurrency:
+  group: lab-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  HARBOR_HOST:     ${{ vars.HARBOR_HOST     || 'harbor.lab.internal' }}
+  HARBOR_PROJECT:  ${{ vars.HARBOR_PROJECT  || 'devopshelpers' }}
+  IMAGE_NAME:      ${{ vars.IMAGE_NAME      || 'kdt' }}                # harbor.lab.internal/devopshelpers/kdt
+  DOCKERFILE:      ${{ vars.DOCKERFILE      || 'Dockerfile' }}
+  KUSTOMIZE_DIR:   ${{ vars.KUSTOMIZE_DIR   || 'deploy/overlays/lab' }}
+  K8S_NAMESPACE:   ${{ vars.K8S_NAMESPACE   || 'devopshelpers' }}
+  PLATFORMS:       linux/arm64                                         # add ,linux/amd64 to also publish for x86 clusters
+  KUBECONFIG:      /etc/github-runner/kubeconfig
+
+jobs:
+  lint:
+    runs-on: [self-hosted, k3s-lab]
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck all scripts
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(git ls-files | grep -E '(\.sh$|^bin/|^scripts/)' | xargs -r file --mime-type | grep 'text/x-shellscript' | cut -d: -f1)
+          [[ ${#files[@]} -eq 0 ]] && { echo "no shell scripts found"; exit 0; }
+          shellcheck -S warning -x "${files[@]}"
+      - name: bash -n on Alpine/Ubuntu compatibility smoke
+        if: hashFiles('bin/**') != ''
+        run: |
+          # your scripts must run on both Alpine (busybox sh) and Ubuntu Noble — exercise both quickly
+          for img in dockerhub/library/alpine:3.20 dockerhub/library/ubuntu:24.04; do
+            docker run --rm -v "$PWD/bin:/t:ro" "${HARBOR_HOST}/${img}" sh -c 'for f in /t/*; do sh -n "$f" || exit 1; done'
+          done
+
+  build:
+    needs: lint
+    runs-on: [self-hosted, k3s-lab]
+    if: github.event_name != 'pull_request'
+    outputs:
+      image:  ${{ steps.meta.outputs.image }}
+      tag:    ${{ steps.meta.outputs.tag }}
+      digest: ${{ steps.push.outputs.digest }}
+      built:  ${{ steps.meta.outputs.built }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: image metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          if [[ ! -f "$DOCKERFILE" ]]; then echo "::notice::no $DOCKERFILE — skipping build"; echo "built=false" >> "$GITHUB_OUTPUT"; exit 0; fi
+          tag="sha-$(git rev-parse --short=12 HEAD)"
+          echo "image=${HARBOR_HOST}/${HARBOR_PROJECT}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "built=true" >> "$GITHUB_OUTPUT"
+
+      - name: set up buildx
+        if: steps.meta.outputs.built == 'true'
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker          # inherits the daemon's trust for the lab CA (docs/04 §2)
+
+      - name: login to Harbor
+        if: steps.meta.outputs.built == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.HARBOR_HOST }}
+          username: ${{ secrets.HARBOR_ROBOT_USER }}
+          password: ${{ secrets.HARBOR_ROBOT_TOKEN }}
+
+      - name: build & push
+        if: steps.meta.outputs.built == 'true'
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ env.DOCKERFILE }}
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          provenance: false       # keep a plain single-arch manifest so Harbor's scanner sees it directly
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag }}
+            ${{ github.ref == 'refs/heads/main' && format('{0}:latest', steps.meta.outputs.image) || '' }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=registry,ref=${{ steps.meta.outputs.image }}:buildcache
+          cache-to:   type=registry,ref=${{ steps.meta.outputs.image }}:buildcache,mode=max
+
+  scan-gate:
+    needs: build
+    if: needs.build.outputs.built == 'true'
+    runs-on: [self-hosted, k3s-lab]
+    env:
+      MAX_CRITICAL: 0            # fail the pipeline above this many Critical CVEs (Harbor's Trivy result)
+    steps:
+      - name: wait for Harbor scan and gate on severity
+        run: |
+          set -euo pipefail
+          api="https://${HARBOR_HOST}/api/v2.0"
+          ref="${{ needs.build.outputs.digest }}"
+          url="${api}/projects/${HARBOR_PROJECT}/repositories/${IMAGE_NAME}/artifacts/${ref}?with_scan_overview=true"
+          for i in $(seq 1 36); do
+            json="$(curl -fsS -u "${{ secrets.HARBOR_ROBOT_USER }}:${{ secrets.HARBOR_ROBOT_TOKEN }}" "$url")"
+            status="$(jq -r '[.scan_overview[]?][0].scan_status // "Pending"' <<<"$json")"
+            [[ "$status" == "Success" || "$status" == "Error" ]] && break
+            echo "scan status: $status ($i/36)"; sleep 10
+          done
+          [[ "$status" == "Success" ]] || { echo "::error::Harbor scan did not finish: $status"; exit 1; }
+          jq -r '[.scan_overview[]?][0].summary.summary // {} | to_entries[] | "\(.key)=\(.value)"' <<<"$json" | tee scan.txt
+          crit="$(jq -r '[.scan_overview[]?][0].summary.summary.Critical // 0' <<<"$json")"
+          {
+            echo "### Harbor / Trivy scan — \`${IMAGE_NAME}:${{ needs.build.outputs.tag }}\`"
+            echo; sed 's/^/- /' scan.txt
+            echo; echo "[open in Harbor](https://${HARBOR_HOST}/harbor/projects?q=${HARBOR_PROJECT})"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if (( crit > MAX_CRITICAL )); then echo "::error::${crit} Critical CVEs (max ${MAX_CRITICAL})"; exit 1; fi
+
+  deploy:
+    needs: [build, scan-gate]
+    if: >
+      needs.build.outputs.built == 'true' && github.ref == 'refs/heads/main' &&
+      (github.event_name != 'workflow_dispatch' || inputs.deploy)
+    runs-on: [self-hosted, k3s-lab]
+    environment: k3s-lab
+    steps:
+      - uses: actions/checkout@v4
+      - name: deploy with kustomize
+        run: |
+          set -euo pipefail
+          if [[ ! -f "${KUSTOMIZE_DIR}/kustomization.yaml" ]]; then echo "::notice::no ${KUSTOMIZE_DIR}/kustomization.yaml — skipping deploy"; exit 0; fi
+          kubectl auth whoami
+          cd "$KUSTOMIZE_DIR"
+          # pin the image we just pushed, by digest, into the lab overlay (local edit only; not committed)
+          kustomize edit set image "${IMAGE_NAME}=${{ needs.build.outputs.image }}@${{ needs.build.outputs.digest }}"
+          kustomize build . | kubectl apply -n "$K8S_NAMESPACE" --server-side --field-manager=gha -f -
+          kubectl -n "$K8S_NAMESPACE" rollout status deployment --all --timeout=180s
+          kubectl -n "$K8S_NAMESPACE" get deploy,po,svc -o wide | tee -a "$GITHUB_STEP_SUMMARY"

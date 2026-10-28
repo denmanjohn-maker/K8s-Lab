@@ -1,0 +1,43 @@
+# Minimal Deployment that passes Pod Security Admission "restricted" (work VKS + lab namespaces).
+# The CI workflow replaces the image via `kustomize edit set image toolbox=<harbor image>@<digest>`.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: toolbox
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: toolbox
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: toolbox
+    spec:
+      imagePullSecrets:
+        - name: harbor-pull            # redundant on k3s-lab (registries.yaml), required on VKS
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: toolbox
+          image: toolbox                 # placeholder name; kustomize `images:` rewrites it
+          command: ["sh", "-c", "echo toolbox up; sleep infinity"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: { cpu: 10m, memory: 32Mi }
+            limits:   { cpu: 200m, memory: 128Mi }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: tmp
+          emptyDir: {}

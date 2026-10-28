@@ -1,0 +1,139 @@
+# ServiceAccount the GitHub Actions runner uses to deploy. One SA (in containerhelper) with a
+# namespaced Role bound in each solution namespace — no cluster-wide write rights.
+# Add verbs/resources to BOTH Role copies as the repos grow (YAML anchors don't span documents).
+# Apply: kubectl apply -f k3s/30-deployer-rbac.yaml
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gha-deployer
+  namespace: containerhelper
+automountServiceAccountToken: false
+---
+# Long-lived token for the SA (k3s/40-make-kubeconfig.sh reads it). Kubernetes mints the token
+# into this Secret because of the annotation + type.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: gha-deployer-token
+  namespace: containerhelper
+  annotations:
+    kubernetes.io/service-account.name: gha-deployer
+type: kubernetes.io/service-account-token
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: deployer
+  namespace: containerhelper
+rules:
+  - apiGroups: ["", "apps", "batch", "networking.k8s.io", "autoscaling", "policy"]
+    resources:
+      - deployments
+      - statefulsets
+      - daemonsets
+      - replicasets
+      - services
+      - configmaps
+      - secrets
+      - serviceaccounts
+      - ingresses
+      - networkpolicies
+      - jobs
+      - cronjobs
+      - horizontalpodautoscalers
+      - poddisruptionbudgets
+      - persistentvolumeclaims
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "pods/status", "events", "endpoints"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/exec", "pods/ephemeralcontainers", "pods/portforward"]
+    verbs: ["create", "get", "patch"]          # kubectl debug --target (your app-* toolbox) + smoke tests
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale", "statefulsets/scale", "deployments/status", "statefulsets/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: deployer
+  namespace: devopshelpers
+rules:
+  - apiGroups: ["", "apps", "batch", "networking.k8s.io", "autoscaling", "policy"]
+    resources:
+      - deployments
+      - statefulsets
+      - daemonsets
+      - replicasets
+      - services
+      - configmaps
+      - secrets
+      - serviceaccounts
+      - ingresses
+      - networkpolicies
+      - jobs
+      - cronjobs
+      - horizontalpodautoscalers
+      - poddisruptionbudgets
+      - persistentvolumeclaims
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "pods/status", "events", "endpoints"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/exec", "pods/ephemeralcontainers", "pods/portforward"]
+    verbs: ["create", "get", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale", "statefulsets/scale", "deployments/status", "statefulsets/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gha-deployer
+  namespace: containerhelper
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: deployer }
+subjects:
+  - kind: ServiceAccount
+    name: gha-deployer
+    namespace: containerhelper
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gha-deployer
+  namespace: devopshelpers
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: deployer }
+subjects:
+  - kind: ServiceAccount
+    name: gha-deployer
+    namespace: containerhelper      # same SA; its token is what the runner holds
+---
+# Read-only view of nodes/namespaces so `kubectl get nodes` and kustomize namespace checks work
+# in workflows. Nothing more cluster-wide.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: gha-deployer-readonly
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "namespaces"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gha-deployer-readonly
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: gha-deployer-readonly }
+subjects:
+  - kind: ServiceAccount
+    name: gha-deployer
+    namespace: containerhelper

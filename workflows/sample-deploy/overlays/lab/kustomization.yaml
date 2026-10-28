@@ -1,0 +1,10 @@
+# Lab overlay. CI runs `kustomize edit set image` here, so `images:` below is the default for manual applies.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: containerhelper
+resources:
+  - ../../base
+images:
+  - name: toolbox
+    newName: harbor.lab.internal/containerhelper/toolbox
+    newTag: latest

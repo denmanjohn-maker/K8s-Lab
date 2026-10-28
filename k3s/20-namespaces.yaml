@@ -1,0 +1,36 @@
+# Namespaces for the two solutions. Pod Security Admission labels mirror work VKS, which
+# enforces "restricted" cluster-wide — so anything that deploys here will also pass there.
+# Apply: kubectl apply -f k3s/20-namespaces.yaml
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: containerhelper
+  labels:
+    app.kubernetes.io/part-of: kubernetes-lab
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: devopshelpers
+  labels:
+    app.kubernetes.io/part-of: kubernetes-lab
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+---
+# Scratch namespace with PSA only *warning*, for kubectl-debug / toolbox experiments that need
+# capabilities the restricted profile forbids. Nothing from CI deploys here.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: lab-sandbox
+  labels:
+    app.kubernetes.io/part-of: kubernetes-lab
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/warn: restricted
