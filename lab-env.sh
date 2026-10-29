@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# lab-env.sh — single source of truth for the Kubernetes Lab (Docker Desktop edition)
+# lab-env.sh — single source of truth for the Kubernetes Lab
 #
 # Source this from every script and from your shell:
 #     source "$HOME/Library/Mobile Documents/com~apple~CloudDocs/Kubernetes Lab/lab-env.sh"
@@ -39,6 +39,9 @@ export GH_OWNER="denmanjohn-maker"
 export GH_REPOS=("ContainerHelperAdditions" "DevOpsHelperTools")
 export RUNNER_LABEL="k3s-lab"               # custom label your workflows target with runs-on
 export RUNNER_LABELS="${RUNNER_LABEL},harbor,arm64"
+# repo:slug — one runner container per repo (personal account). The slug names the compose service
+# runner-<slug>, the container, and secrets/runner-token-<slug>. Keep in step with runner/docker-compose.yml.
+export RUNNER_REPOS=("ContainerHelperAdditions:containerhelper" "DevOpsHelperTools:devopshelpers")
 # -----------------------------------------------------------------------------
 
 # ---- Versions (checked 2026-10-28) -------------------------------------------
@@ -108,7 +111,7 @@ k3d_nodes() {
   for ((i = 0; i < K3D_AGENTS; i++));  do echo "k3d-${K3D_CLUSTER}-agent-${i}"; done
 }
 
-# The replacement for `ssh user@node cmd`:  lab_node_exec k3d-k3s-lab-agent-0 cat /etc/rancher/k3s/registries.yaml
+# Run a command on a node:  lab_node_exec k3d-k3s-lab-agent-0 cat /etc/rancher/k3s/registries.yaml
 lab_node_exec() { local n="$1"; shift; docker exec "$n" "$@"; }
 
 # Render a template to stdout: ${VAR} from the environment; unknown names (e.g. containerd's "$1") are left alone.

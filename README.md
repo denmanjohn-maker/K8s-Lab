@@ -24,17 +24,17 @@ stack, the cluster as k3d (K3s nodes as containers), the runners as containers.
                                   └───────────────────────────┘
 ```
 
-Design decisions (2026-10-27, hypervisor changed 2026-10-28 — see docs/09):
+Design decisions:
 
 | Decision | Choice | Why |
 |---|---|---|
-| Hypervisor | **Docker Desktop** (one VM), not VMware Fusion | Every lab role has a standard Docker shape; 12 GB instead of 20 GB of VMs; nothing to license beyond personal use |
+| Platform | **Docker Desktop** (one Linux VM) | Every lab role has a standard Docker shape; ~12 GB for the whole lab; free for personal use (paid above 250 employees / $10M revenue) |
 | Cluster | **k3d**, `rancher/k3s:v1.34.x` pinned in `lab-env.sh` | Same K8s minor as work VKS; `registries.yaml`/CA plumbing identical to real nodes; rebuilds in ~2 min |
 | Harbor | **Compose stack from the official offline installer**, data under `~/Lab/harbor` | Mirrors how on-prem shops run it; registry survives cluster rebuilds; stays out of iCloud |
 | Harbor version | **v2.16.0-rc1, arm64 offline installer** | First Harbor with official arm64 images. Swap to `v2.16.0` GA when it ships |
-| Runners | **Containers built on `ghcr.io/actions/actions-runner`**, one per repo, Docker socket mounted | Same labels and job environment as the old VM runner; `/home/runner` on a volume so registration survives restarts |
+| Runners | **Containers built on `ghcr.io/actions/actions-runner`**, one per repo, Docker socket mounted | Classic long-lived runners with the `k3s-lab` label, like work; `/home/runner` on a volume so registration survives restarts |
 | TLS | **Private lab CA** (`secrets/certs/ca.crt`) trusted by the Mac keychain (= Docker Desktop's engine), the nodes (`ca_file`) and the runner image | Realistic — forces the same CA-trust plumbing you do at work |
-| Names | `harbor.lab.internal` → `127.0.0.1` on the Mac; a Docker DNS alias on Harbor's nginx inside the VM | One hosts line instead of five; `.internal` is reserved for private use, `.local` collides with mDNS |
+| Names | `harbor.lab.internal` → `127.0.0.1` on the Mac; a Docker DNS alias on Harbor's nginx inside the VM | One hosts line on the Mac; `.internal` is reserved for private use, `.local` collides with mDNS |
 | k9s | installed on the Mac and in the runner image | your TUI of choice; `k9s --context k3d-k3s-lab` |
 
 ## Folder layout
@@ -43,7 +43,8 @@ Design decisions (2026-10-27, hypervisor changed 2026-10-28 — see docs/09):
 Kubernetes Lab/
 ├── README.md                 ← you are here
 ├── lab-env.sh                ← EDIT ME: names, sizes, versions; sourced by every script
-├── lab.sh                    ← up / stop / status / create-cluster / destroy-cluster / shell / prune
+├── install.sh                ← ONE COMMAND: tools → CA → hosts → Harbor → cluster → GitHub → runners → verify
+├── lab.sh                    ← day-2: up / stop / status / create-cluster / destroy-cluster / shell / prune / reset
 ├── docs/
 │   ├── 01-architecture.md    ← components, networking, trust, credential flow
 │   ├── 02-cluster-k3s.md     ← k3d cluster, kubeconfig, k9s, namespaces, PSA
@@ -52,8 +53,7 @@ Kubernetes Lab/
 │   ├── 05-github-runner.md   ← build + register the runner containers
 │   ├── 06-deploy-workflows.md← build→Harbor→k3s pipelines for both repos
 │   ├── 07-operations.md      ← start/stop, backup, upgrades, GC, disk
-│   ├── 08-troubleshooting.md ← symptoms → fixes
-│   └── 09-plan-docker-desktop.md ← the Fusion → Docker Desktop migration: cutover + Fusion removal
+│   └── 08-troubleshooting.md ← symptoms → fixes
 ├── harbor/
 │   ├── 20-gen-certs.sh       ← Mac: lab CA (10y) + Harbor server cert (2y, SANs)
 │   ├── 30-install-harbor.sh  ← Mac: download arm64 installer, render harbor.yml, install --with-trivy
@@ -81,21 +81,33 @@ Kubernetes Lab/
 └── secrets/                  ← git-ignored: CA key, passwords, robot tokens, kubeconfig, rendered configs
 ```
 
-## Quick start (order matters)
+## Quick start
 
-| # | Where | Command / action | Doc |
+Prerequisites: a Mac with Homebrew, and (optional, recommended) `gh auth login` so the installer can set the repo
+secrets and fetch runner tokens itself.
+
+```bash
+cd "$HOME/Library/Mobile Documents/com~apple~CloudDocs/Kubernetes Lab"
+vi lab-env.sh          # names, HARBOR_HOME, sizes, versions — defaults are fine for the M5
+./install.sh           # ~30 min, mostly downloads; sudo asked for the keychain and /etc/hosts
+```
+
+`install.sh` is idempotent: re-run it after fixing anything, or `./install.sh --from <stage>` / `--only <stage>`.
+What it does, stage by stage:
+
+| # | Stage | What happens | Doc |
 |---|---|---|---|
-| 0 | Mac | Install Docker Desktop (Resources: 12 GB / 6 CPU), `brew install k3d kubectl derailed/k9s/k9s`; edit `lab-env.sh`; `source lab-env.sh` | 01 |
-| 1 | Mac | `harbor/20-gen-certs.sh` → `secrets/certs/{ca.crt,ca.key,harbor.crt,harbor.key}`; trust `ca.crt` in the System keychain; **restart Docker Desktop** | 03/04 |
-| 2 | Mac | `scripts/hosts-entry.sh --apply` (`127.0.0.1 harbor.lab.internal`) | 01 |
-| 3 | Mac | `harbor/30-install-harbor.sh` → Harbor under `~/Lab/harbor`, healthy at `https://harbor.lab.internal` | 03 |
-| 4 | Mac | `harbor/40-init-harbor.sh` → projects, proxy cache, robots, scan-on-push | 03 |
-| 5 | Mac | `k3s/10-render-registries.sh`; `./lab.sh create-cluster` → 3 nodes Ready, context `k3d-k3s-lab` | 02/04 |
-| 6 | Mac | `kubectl apply -f k3s/20-namespaces.yaml -f k3s/30-deployer-rbac.yaml`; `k3s/50-pull-secrets.sh`; `k3s/40-make-kubeconfig.sh` | 02 |
-| 7 | GitHub | New self-hosted runner (per repo) → registration token → `secrets/runner-token-<repo>` | 05 |
-| 8 | Mac | `docker compose -f runner/docker-compose.yml up -d --build` → runners *Idle* with label `k3s-lab` | 05 |
-| 9 | GitHub | Add repo secrets `HARBOR_ROBOT_USER` / `HARBOR_ROBOT_TOKEN`; copy workflows | 06 |
-| 10 | Mac | `scripts/verify.sh` — pulls through proxy cache, node pull, restricted pod, runner checks | 07 |
+| 1 | `tools` | `brew install k3d kubectl jq gh k9s`, Docker Desktop (cask) if missing, waits for the engine, warns if the VM has < 11 GB | 02 §5 |
+| 2 | `certs` | `harbor/20-gen-certs.sh` → lab CA + Harbor cert; trusts the CA in the System keychain; restarts Docker Desktop so its engine trusts it | 03 §1, 04 |
+| 3 | `hosts` | `scripts/hosts-entry.sh --apply` → `127.0.0.1 harbor.lab.internal` | 01 |
+| 4 | `harbor` | `harbor/30-install-harbor.sh` (Harbor under `~/Lab/harbor`) and `harbor/40-init-harbor.sh` (projects, proxy cache, robots) | 03 |
+| 5 | `cluster` | `k3s/10-render-registries.sh`; `./lab.sh create-cluster`; namespaces + RBAC; `k3s/50-pull-secrets.sh`; `k3s/40-make-kubeconfig.sh` | 02, 04 |
+| 6 | `github` | with `gh`: repo secrets `HARBOR_ROBOT_USER/TOKEN` + a registration token per repo; without: you paste the tokens | 05 §4, 06 §1 |
+| 7 | `runners` | `docker compose -f runner/docker-compose.yml up -d --build`; waits for "Listening for Jobs" | 05 |
+| 8 | `verify` | `scripts/verify.sh --quick` | 07 |
+
+The one thing that stays manual: copy `workflows/*.yml` into each repo (docs/06 §1). Day-2 is `./lab.sh`
+(`status`, `up`, `stop`, `reset` to wipe everything and start over).
 
 Sizing on the 24 GB MacBook Pro: give the Docker Desktop VM **12 GB** (Harbor ~2.5 GB, three K3s nodes ~3 GB,
 runners idle ~0.3 GB, a .NET build 2–3 GB while it runs). 10 GB works if you run one build at a time — docs/02 §5.
@@ -104,6 +116,6 @@ runners idle ~0.3 GB, a .NET build 2–3 GB while it runs). 10 GB works if you r
 
 - Every script is `bash`, `set -euo pipefail`, idempotent, runs **on the Mac**, and sources `lab-env.sh`.
 - Scripts named `NN-*.sh` run in numeric order within their folder.
-- "Node" = a k3d node container (`docker exec k3d-k3s-lab-server-0 …`, or `./lab.sh shell`), the stand-in for SSH.
+- "Node" = a k3d node container; you get onto one with `./lab.sh shell` or `docker exec k3d-k3s-lab-server-0 …`.
 - Secrets never go in docs or git. `secrets/` has a `.gitignore` with `*`.
 - Image naming: `harbor.lab.internal/<project>/<image>:<git-sha>` plus a moving `:latest` only on `main`.

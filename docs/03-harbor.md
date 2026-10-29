@@ -2,7 +2,8 @@
 
 Goal: `https://harbor.lab.internal` serving Harbor **v2.16.0-rc1 (arm64)** with Trivy, a Docker Hub proxy
 cache, and two robot accounts — as a compose stack on the Mac's Docker engine. Estimated time: 20–30 min,
-most of it the 700 MB installer download.
+most of it the 700 MB installer download. `./install.sh` runs §1 (stage `certs` + `hosts`) and §3–§4 (stage
+`harbor`); this doc is the by-hand version and the reference for what each step does.
 
 > **Why 2.16.0-rc1?** Harbor only started publishing official multi-arch images and an arm64 offline
 > installer with 2.16.0 ("Full Multi-Architecture Enablement", PR #22311). Every stable release up to

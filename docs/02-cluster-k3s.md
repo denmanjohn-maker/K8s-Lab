@@ -8,6 +8,7 @@ same minor as work VKS), default add-ons (Traefik, CoreDNS, local-path, metrics-
 
 Harbor must be installed and running first (docs/03) — the nodes join Harbor's docker network and mount the
 registries file, so `create-cluster` refuses to run without `harbor_harbor` and `secrets/registries.yaml`.
+`./install.sh` runs this section and §3 as its `cluster` stage; by hand:
 
 ```bash
 cd "$HOME/Library/Mobile Documents/com~apple~CloudDocs/Kubernetes Lab"
@@ -92,9 +93,9 @@ above (the `lab-sandbox` namespace is there for when it doesn't).
 
 Change node caps in `lab-env.sh` (`K3D_SERVER_MEMORY`, `K3D_AGENT_MEMORY`) and re-create the cluster.
 
-## 6. Nodes without SSH
+## 6. Working on a node
 
-`docker exec` is the SSH of this lab:
+Everything on a node goes through `docker exec`:
 
 ```bash
 ./lab.sh shell                                           # sh on k3d-k3s-lab-server-0

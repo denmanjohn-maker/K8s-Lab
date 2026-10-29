@@ -24,7 +24,7 @@ RUN apt-get update \
 COPY --from=certs ca.crt /usr/local/share/ca-certificates/kubernetes-lab-ca.crt
 RUN update-ca-certificates
 
-# kubectl pinned to the K3s/VKS minor; the rest tracks latest like the old runner VM did.
+# kubectl pinned to the K3s/VKS minor; the rest tracks latest.
 RUN set -eux; arch="${TARGETARCH}"; \
     KVER="$(curl -fsSL "https://dl.k8s.io/release/stable-${K3S_CHANNEL#v}.txt")"; \
     curl -fsSL -o /usr/local/bin/kubectl "https://dl.k8s.io/release/${KVER}/bin/linux/${arch}/kubectl"; \

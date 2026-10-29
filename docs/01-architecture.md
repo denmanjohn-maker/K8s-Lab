@@ -26,7 +26,8 @@ One Docker bridge network, `harbor_harbor` (created by Harbor's compose file), c
   binds published ports inside the VM too, so `docker push harbor.lab.internal/…` from the Mac and from a job
   takes the same path. The domain is `lab.internal` — ICANN reserved `.internal` for private use in 2024, and unlike
   `.local` it does not collide with macOS mDNS/Bonjour.
-- Nothing has a fixed IP and nothing needs one.
+- Node-level work (`registries.yaml`, `crictl`, containerd config, logs) is `docker exec` into the node container
+  (`./lab.sh shell`).
 
 Ports published on the Mac:
 
@@ -73,7 +74,7 @@ Two deliberate choices:
    the job and the robot account is already least-privilege and revocable from Harbor.
 
 One consequence of the Docker shape: the runner containers hold the Docker socket, which is root on the Docker
-VM — the same standing the old runner VM had with its own Docker daemon. Keep both repos private (docs/05 §4).
+VM. Keep both repos private (docs/05 §4).
 
 ## How a deploy flows
 
@@ -95,5 +96,3 @@ VM — the same standing the old runner VM had with its own Docker daemon. Keep 
 - Not using Actions Runner Controller. You chose classic long-lived runners; ARC notes are in docs/05 §6.
 - Not Harbor-in-cluster via Helm. Keeping the registry outside the cluster is what lets you destroy and
   recreate `k3s-lab` freely.
-- Not five VMs any more. Node-level exercises (SSH, systemd, ufw, Netplan) went with Fusion — docs/09 §0 records
-  the trade. `docker exec` into a node covers `registries.yaml`, `crictl`, containerd config and logs.

@@ -5,10 +5,13 @@
 #   ./lab.sh status           what is running, Harbor health, nodes
 #   ./lab.sh create-cluster   k3d cluster from k3s/k3d-config.yaml.template (needs Harbor up + secrets/registries.yaml)
 #   ./lab.sh destroy-cluster  delete the k3d cluster — Harbor keeps every image, re-create in ~2 min
-#   ./lab.sh shell [node]     shell into a k3d node (default: server-0); the replacement for ssh
+#   ./lab.sh shell [node]     shell into a k3d node (default: server-0)
 #   ./lab.sh prune            reclaim Docker disk: build cache, old images
+#   ./lab.sh reset [--yes] [--purge-secrets]
+#                             remove everything (runners, cluster, Harbor + data, hosts line, keychain CA)
+#                             so ./install.sh starts from scratch; secrets/ is kept unless --purge-secrets
 # Docker Desktop restarts everything by itself at login (Harbor: restart always, nodes/runners:
-# unless-stopped); `up` is for after `stop`, and it enforces the order.
+# unless-stopped); `up` is for after `stop`, and it enforces the order. First install: ./install.sh
 set -euo pipefail
 # shellcheck source=lab-env.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lab-env.sh"
@@ -33,7 +36,7 @@ wait_harbor() {
 cmd_up() {
   lab_docker_ok; lab_need k3d "brew install k3d"
   if harbor_installed; then harbor_compose up -d; wait_harbor
-  else lab_warn "Harbor not installed yet — ./harbor/30-install-harbor.sh (docs/03)"; fi
+  else lab_warn "Harbor not installed yet — ./install.sh (docs/03)"; fi
   if cluster_exists; then k3d cluster start "$K3D_CLUSTER"
   else lab_warn "no k3d cluster yet — ./lab.sh create-cluster (docs/02)"; fi
   if runners_ready; then runner_compose up -d
@@ -80,7 +83,7 @@ cmd_create_cluster() {
   kubectl get nodes -o wide
   cat <<EOF
 
-Cluster up. Next (docs/02 §3):
+Cluster up. Next (docs/02 §3; ./install.sh --from cluster does these):
   kubectl apply -f k3s/20-namespaces.yaml -f k3s/30-deployer-rbac.yaml
   ./k3s/50-pull-secrets.sh
   ./k3s/40-make-kubeconfig.sh
@@ -107,6 +110,41 @@ cmd_prune() {
   docker system df
 }
 
+cmd_reset() {
+  local yes=0 purge=0 a
+  for a in "$@"; do case "$a" in --yes|-y) yes=1 ;; --purge-secrets) purge=1 ;; *) lab_die "reset: unknown option $a" ;; esac; done
+  cat <<EOF
+This removes: runner containers + their home volumes (and their GitHub registrations if gh works),
+the k3d cluster, Harbor and ALL registry data under ${HARBOR_HOME}, the /etc/hosts line, and the
+lab CA from the System keychain. secrets/ is $([[ $purge -eq 1 ]] && echo DELETED || echo kept).
+EOF
+  if (( yes == 0 )); then read -r -p "Type 'reset' to continue: " a; [[ "$a" == "reset" ]] || lab_die "aborted"; fi
+  lab_docker_ok
+  if [[ -n "$(runner_compose ps -aq 2>/dev/null)" ]]; then
+    if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+      local entry repo slug id
+      for entry in "${RUNNER_REPOS[@]}"; do
+        repo="${entry%%:*}"; slug="${entry##*:}"
+        id="$(gh api "repos/${GH_OWNER}/${repo}/actions/runners" --jq ".runners[] | select(.name==\"runner-${slug}\") | .id" 2>/dev/null || true)"
+        [[ -z "$id" ]] || { gh api -X DELETE "repos/${GH_OWNER}/${repo}/actions/runners/${id}" >/dev/null && lab_log "removed runner-${slug} from GitHub (${repo})"; }
+      done
+    else
+      lab_warn "gh not available: remove the runners by hand under each repo's Settings → Actions → Runners"
+    fi
+    runner_compose down -v
+  fi
+  if command -v k3d >/dev/null 2>&1 && cluster_exists; then k3d cluster delete "$K3D_CLUSTER"; fi
+  if harbor_installed; then harbor_compose down -v || true; fi
+  [[ -d "$HARBOR_HOME" ]] && { lab_log "removing $HARBOR_HOME"; rm -rf "$HARBOR_HOME"; }
+  ./scripts/hosts-entry.sh --remove
+  if security find-certificate -c "Kubernetes Lab CA" /Library/Keychains/System.keychain >/dev/null 2>&1; then
+    lab_log "removing the lab CA from the System keychain (sudo)"
+    sudo security delete-certificate -c "Kubernetes Lab CA" /Library/Keychains/System.keychain
+  fi
+  if (( purge )); then rm -rf "$LAB_SECRETS"; mkdir -p "$LAB_CERTS"; chmod 700 "$LAB_SECRETS"; lab_log "secrets/ purged"; fi
+  lab_log "reset complete — ./install.sh rebuilds everything (Docker Desktop restarts once for the CA)"
+}
+
 case "${1:-}" in
   up)              cmd_up ;;
   stop)            cmd_stop ;;
@@ -115,5 +153,6 @@ case "${1:-}" in
   destroy-cluster) cmd_destroy_cluster ;;
   shell)           cmd_shell "${2:-}" ;;
   prune)           cmd_prune ;;
-  *) sed -n '2,10p' "$0"; exit 1 ;;
+  reset)           shift; cmd_reset "$@" ;;
+  *) sed -n '2,13p' "$0"; exit 1 ;;
 esac

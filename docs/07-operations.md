@@ -12,6 +12,7 @@ Harbor first, cluster second, runners last — the cluster pulls from Harbor and
 | **Low-memory mode** | `docker compose -f runner/docker-compose.yml stop` (queued jobs wait; runners show *Offline*), or `k3d cluster stop k3s-lab` when only Harbor work is needed. Harbor has to stay up while the cluster is pulling |
 | **Cluster rebuild** | `./lab.sh destroy-cluster && ./lab.sh create-cluster`, then docs/02 §3 (three commands) and a runner restart. Harbor keeps every image |
 | **Everything off** | `./lab.sh stop`, then quit Docker Desktop (Resource Saver also idles the VM on its own) |
+| **Everything gone** | `./lab.sh reset` — runners (and their GitHub registrations), cluster, Harbor + data, hosts line, keychain CA. `secrets/` stays unless `--purge-secrets`. `./install.sh` rebuilds it all |
 
 Quick health check from the Mac: `./lab.sh status` or `./scripts/verify.sh`.
 
@@ -48,8 +49,7 @@ rm -rf "$HARBOR_HOME/data" && tar -C "$HARBOR_HOME" -xzf ~/Backups/kubernetes-la
 ```
 
 Do not restore `harbor.yml` itself across machines — `data_volume` and `log.local.location` are absolute paths and
-`30-install-harbor.sh` renders the right ones. Restoring `data/` from the old **Fusion** Harbor VM works the same way
-(the VM tarball has `data` at the root: `tar -xzf harbor-backup.tgz data`).
+`30-install-harbor.sh` renders the right ones.
 
 Alternative without downtime: `docker compose … exec postgresql pg_dumpall -U postgres > db.sql` plus a copy of
 `data/registry`; restore is more fiddly, so the stop-and-tar approach is the lab default. Time Machine also sees

@@ -26,8 +26,8 @@ services:
     container_name: runner-containerhelper
     restart: unless-stopped
     # Docker Desktop mounts the socket as root:root 0660 inside containers; adding the root group
-    # to the (non-root) runner user is the usual fix. Same trust as the old VM: the socket is root
-    # on the Docker VM, so keep the repos private (docs/05 §4).
+    # to the (non-root) runner user is the usual fix. The socket is root on the Docker VM, so keep
+    # the repos private (docs/05 §4).
     group_add: ["0"]
     environment:
       <<: *env

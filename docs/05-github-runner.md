@@ -1,9 +1,9 @@
 # 05 — On-prem GitHub Actions runners (containers)
 
 Two long-lived runner containers, one per repo, built from GitHub's official runner image plus the tools the
-workflows use. Workflows target them with `runs-on: [self-hosted, k3s-lab]`. The split of responsibilities is the
-same as before: the lab builds the image and wires Docker, the CA and the kubeconfig; **you** supply the GitHub
-registration token.
+workflows use. Workflows target them with `runs-on: [self-hosted, k3s-lab]`. Split of responsibilities: the lab
+builds the image and wires Docker, the CA and the kubeconfig; GitHub supplies a registration token per runner —
+fetched for you by `./install.sh` when `gh` is logged in, pasted by you otherwise (§4).
 
 ## 1. What is in the image — `runner/Dockerfile`
 
@@ -27,7 +27,7 @@ docker compose -f runner/docker-compose.yml build --pull
 
 | Item | Setting | Why |
 |---|---|---|
-| Docker | `/var/run/docker.sock` mounted; `group_add: ["0"]` | jobs build with Docker Desktop's engine (same engine as the Mac). The socket is `root:root 0660` inside containers on Docker Desktop, so the runner user is added to the root group. Holding the socket = root on the Docker VM, as the old VM runner was root on its own Docker |
+| Docker | `/var/run/docker.sock` mounted; `group_add: ["0"]` | jobs build with Docker Desktop's engine (same engine as the Mac). The socket is `root:root 0660` inside containers on Docker Desktop, so the runner user is added to the root group. Holding the socket = root on the Docker VM |
 | kubeconfig | `secrets/kubeconfig-gha-deployer.yaml` → `/etc/github-runner/kubeconfig`, read-only; `KUBECONFIG` set | the `gha-deployer` SA (docs/02 §3); the server address is `https://k3d-k3s-lab-server-0:6443`, resolvable because… |
 | network | `harbor_harbor` (external) | …the runners sit on Harbor's docker network with the k3d nodes; `harbor.lab.internal` resolves to nginx |
 | state | named volume per runner at `/home/runner` | `.runner`, `.credentials`, `_work` and the self-updated runner survive restarts and image rebuilds |
@@ -44,7 +44,23 @@ Memory: an idle runner is ~150 MB; a .NET build inside a job needs 2–3 GB of t
 
 Nothing to copy: the compose file mounts it. After re-running (cluster rebuilt): `docker compose -f runner/docker-compose.yml restart`.
 
-## 4. Register the runners (you)
+## 4. Register the runners
+
+`./install.sh` does this as its `github` + `runners` stages. With `gh` logged in (`gh auth login`), it sets the two
+Harbor robot secrets on each repo, fetches a registration token per repo through the API, writes it to
+`secrets/runner-token-<slug>`, builds the image and starts the containers. Without `gh` it prints the two
+"New self-hosted runner" URLs and asks you to paste the tokens. The by-hand equivalent of the `gh` path:
+
+```bash
+source lab-env.sh
+for entry in "${RUNNER_REPOS[@]}"; do
+  repo="${entry%%:*}"; slug="${entry##*:}"
+  gh secret set HARBOR_ROBOT_USER  -R "$GH_OWNER/$repo" < secrets/harbor-robot-gha-push.user
+  gh secret set HARBOR_ROBOT_TOKEN -R "$GH_OWNER/$repo" < secrets/harbor-robot-gha-push.token
+  gh api -X POST "repos/$GH_OWNER/$repo/actions/runners/registration-token" --jq .token > "secrets/runner-token-$slug"
+done
+docker compose -f runner/docker-compose.yml up -d --build
+```
 
 Facts that shape the install:
 
@@ -58,8 +74,8 @@ Facts that shape the install:
 - **Non-root.** Jobs run as `runner` (uid 1001). `group_add: ["0"]` only grants the socket.
 - **Version.** `RUNNER_VERSION` in `lab-env.sh` pins the image tag; the runner self-updates afterwards.
 
-GitHub → repo → **Settings → Actions → Runners → New self-hosted runner → Linux → ARM64**. Copy only the
-`--token` value from the page (valid for 1 h):
+Manual path (no `gh`): GitHub → repo → **Settings → Actions → Runners → New self-hosted runner → Linux → ARM64**.
+Copy only the `--token` value from the page (valid for 1 h):
 
 ```bash
 source lab-env.sh
