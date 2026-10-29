@@ -61,6 +61,22 @@ use and needs a paid subscription on company machines above 250 employees or $10
 
 Fusion keeps running while you do them. Each is 30–60 min. Record the result here.
 
+`scripts/phase0-spikes.sh` runs them: `preflight` (tools, Docker Desktop resources, free ports, file sharing,
+CA, `/etc/hosts`), then `s1` … `s4`, or `all` for preflight + S1–S3 (the gate). Each spike calls the repo's own
+scripts, prints PASS/FAIL per criterion, writes its verdict into the Result column below, and logs to
+`secrets/phase0-<timestamp>.log`. It asks before the two `sudo` steps (keychain trust, `/etc/hosts`) and the
+Docker Desktop restart; `--yes` skips the prompts, `--no-record` leaves this file alone. Notes:
+
+- S1's "a scan completes" is checked in S2, which pushes the first image (the `lab` project and robots come from
+  `40-init-harbor.sh`, which S2 runs).
+- S3 deploys `workflows/sample-deploy` with its image swapped for the proxy-cached `alpine:3.20` (the real
+  `toolbox` image only exists after CI); it also proves the `docker.io` mirror by pulling `busybox` through Harbor.
+- S4 needs a runner token in `secrets/runner-token-containerhelper`; it records ◐ until you run `runner-smoke`
+  on GitHub (it offers to dispatch it with `gh` when that is installed).
+- If `secrets/certs/` is empty here but the Fusion lab's CA exists in another checkout, copy that `secrets/`
+  in first: the CA is already trusted in the keychain, and S1 then skips the trust + restart.
+- `cleanup` removes the S3 sample and the S2 test image; Harbor and the cluster stay for Phase 2/3.
+
 | # | Spike | Pass criterion | Result | If it fails |
 |---|---|---|---|---|
 | S1 | **Harbor compose on Docker Desktop.** `harbor/20-gen-certs.sh`, keychain + restart, `scripts/hosts-entry.sh --apply`, `harbor/30-install-harbor.sh` (fresh `HARBOR_HOME`) | `curl --cacert secrets/certs/ca.crt https://harbor.lab.internal/api/v2.0/health` healthy; `docker compose … ps` shows `nginx`, `log`, `core` up; a scan completes | ☐ | logging: uncomment the `json-file` fallback in the override template; file sharing: add `~/Lab`; port 443 busy: `sudo lsof -iTCP:443` |
@@ -103,7 +119,7 @@ compose override merged against a Harbor-shaped base file; the `harbor.yml` patc
 - [ ] `source lab-env.sh`; review `HARBOR_HOME`, `K3S_IMAGE`, `RUNNER_VERSION`
 - [ ] **Harbor backup from the Fusion VM** per the old procedure (`docker compose down` on the VM, `tar … data opt/harbor/harbor.yml`, `scp` to `~/Backups/kubernetes-lab/`)
 - [ ] copy of `secrets/` somewhere safe
-- [ ] spikes S1–S4 (§2) — they double as the first real install; keep the spike Harbor if S1 passes
+- [ ] spikes S1–S4 (§2): `./scripts/phase0-spikes.sh all`, then `s4` — they double as the first real install; keep the spike Harbor if S1 passes
 
 **Phase 2 — Harbor**
 - [ ] Fusion Harbor VM: `cd /opt/harbor && sudo docker compose down` (frozen, not deleted)

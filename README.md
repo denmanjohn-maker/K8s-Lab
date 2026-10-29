@@ -77,6 +77,7 @@ Kubernetes Lab/
 │   └── sample-deploy/               ← PSA-restricted-clean Kustomize base + overlays/lab starter
 ├── scripts/
 │   ├── hosts-entry.sh        ← print / --apply the single /etc/hosts line on the Mac
+│   ├── phase0-spikes.sh      ← migration Phase 0 (docs/09 §2): preflight + spikes S1–S4, records results
 │   └── verify.sh             ← end-to-end smoke test (names, TLS, Harbor, k3d, runners)
 └── secrets/                  ← git-ignored: CA key, passwords, robot tokens, kubeconfig, rendered configs
 ```
