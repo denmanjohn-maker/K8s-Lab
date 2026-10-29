@@ -64,6 +64,17 @@ stage_tools() {
   if (( mem < 11 * 1024 * 1024 * 1024 )); then
     lab_warn "Docker Desktop VM has $(( mem / 1024 / 1024 / 1024 )) GB — set 12 GB / 6 CPU under Settings → Resources (docs/02 §5)"
   fi
+  # Ports the lab publishes on the Mac. Only a problem when something other than our own containers holds them.
+  local p owner
+  for p in "$HARBOR_HTTP_PORT" "$HARBOR_HTTPS_PORT" "$K8S_API_HOST_PORT" "$TRAEFIK_HTTP_PORT" "$TRAEFIK_HTTPS_PORT"; do
+    owner="$(lsof -nP -iTCP:"$p" -sTCP:LISTEN 2>/dev/null | awk 'NR==2{print $1}')"
+    [[ -z "$owner" || "$owner" == com.docke* ]] || lab_warn "port $p is held by '$owner' — the lab needs it (docs/08 §1)"
+  done
+  # Docker Desktop file sharing must cover HARBOR_HOME (bind mounts for Harbor's data/ and log/).
+  mkdir -p "$HARBOR_HOME"
+  if ! docker run --rm -v "$HARBOR_HOME:/probe" alpine:3.20 sh -c 'touch /probe/.share-probe && rm /probe/.share-probe' >/dev/null 2>&1; then
+    lab_warn "Docker cannot bind-mount $HARBOR_HOME — add it under Settings → Resources → File sharing (docs/08 §1)"
+  fi
   lab_log "tools OK: $(docker version --format 'engine {{.Server.Version}}'), k3d $(k3d version 2>/dev/null | head -1 | awk '{print $3}'), kubectl $(kubectl version --client -o json 2>/dev/null | jq -r .clientVersion.gitVersion)"
 }
 
