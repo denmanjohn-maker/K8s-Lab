@@ -69,7 +69,7 @@ docker buildx create --name lab --driver docker-container --config buildkitd.tom
 
 ```bash
 sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain secrets/certs/ca.crt
-# then: Docker menu → Restart
+docker desktop restart              # or Docker menu → Restart (install.sh does this for you)
 docker pull harbor.lab.internal/dockerhub/library/alpine:3.20     # proves it
 ```
 

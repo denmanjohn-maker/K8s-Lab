@@ -60,7 +60,11 @@ What it does, so you can do it by hand on a work box:
 6. Renders `docker-compose.override.yml` next to Harbor's compose file: the `proxy` service (container `nginx`)
    gets the network aliases `harbor.lab.internal` and `harbor`, so k3d nodes and runners on `harbor_harbor` reach it by
    the real hostname. Compose merges override files automatically; Harbor's `prepare` never touches it.
-7. `./install.sh --with-trivy` — loads the arm64 images from the tarball and brings up compose.
+7. The three steps Harbor's own `install.sh` would do: `docker load` of the arm64 images (skipped when they
+   are already present), `./prepare --with-trivy`, `docker compose up -d`. Between prepare and up it touches
+   `harbor/common/config/registry/root.crt`: Docker Desktop cannot bind-mount a file into a directory that is
+   itself a bind mount unless the mountpoint already exists on the host (docker/for-mac#7853), and the
+   `registry` container does exactly that with `root.crt`.
 8. Polls `/api/v2.0/health` until `healthy`.
 
 Re-running the script on an installed Harbor = **reconfigure**: it re-renders `harbor.yml` and runs

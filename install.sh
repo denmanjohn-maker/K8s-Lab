@@ -7,7 +7,7 @@
 #   ./install.sh --skip-github     don't use `gh`: paste the runner registration tokens when asked
 #   ./install.sh --yes             never prompt; with missing tokens it stops before the runners stage
 # Needs: macOS with Homebrew. sudo is used twice: trusting the lab CA (keychain) and the /etc/hosts line.
-set -euo pipefail
+set -Eeuo pipefail            # -E: the ERR trap below also fires inside the stage functions
 # shellcheck source=lab-env.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lab-env.sh"
 
@@ -28,14 +28,21 @@ for s in "$FROM" "$ONLY"; do
 done
 [[ "$(uname -s)" == "Darwin" ]] || lab_die "this installer is for macOS with Docker Desktop"
 cd "$LAB_ROOT"
+# Never fail silently: name the stage, line and command when something exits non-zero.
+trap 'lab_warn "install.sh stopped in stage ${CURRENT_STAGE:-?} at line $LINENO: $BASH_COMMAND"' ERR
 
 # ---- helpers -----------------------------------------------------------------
 docker_wait() { local i; for i in $(seq 1 90); do docker info >/dev/null 2>&1 && return 0; sleep 2; done; return 1; }
 docker_restart() {
   lab_log "restarting Docker Desktop so its engine rebuilds the CA bundle from the keychain"
-  osascript -e 'quit app "Docker"' >/dev/null 2>&1 || true
-  local i; for i in $(seq 1 30); do docker info >/dev/null 2>&1 || break; sleep 2; done
-  open -a Docker
+  if docker desktop --help >/dev/null 2>&1; then
+    docker desktop restart >/dev/null 2>&1 || lab_warn "docker desktop restart returned non-zero; waiting for the engine anyway"
+  else
+    # Older Docker Desktop without the `docker desktop` CLI: ask the app to quit, then relaunch it.
+    osascript -e 'quit app "Docker"' >/dev/null 2>&1 || true
+    local i; for i in $(seq 1 30); do docker info >/dev/null 2>&1 || break; sleep 2; done
+    open -a Docker
+  fi
   docker_wait || lab_die "Docker Desktop did not come back — open it by hand, then re-run"
 }
 harbor_healthy() { curl -fsS --cacert "$LAB_CERTS/ca.crt" "https://${HARBOR_HOST}/api/v2.0/health" 2>/dev/null | grep -q '"healthy"'; }
@@ -67,7 +74,8 @@ stage_tools() {
   # Ports the lab publishes on the Mac. Only a problem when something other than our own containers holds them.
   local p owner
   for p in "$HARBOR_HTTP_PORT" "$HARBOR_HTTPS_PORT" "$K8S_API_HOST_PORT" "$TRAEFIK_HTTP_PORT" "$TRAEFIK_HTTPS_PORT"; do
-    owner="$(lsof -nP -iTCP:"$p" -sTCP:LISTEN 2>/dev/null | awk 'NR==2{print $1}')"
+    # lsof exits 1 when nothing listens; keep that from tripping pipefail.
+    owner="$({ lsof -nP -iTCP:"$p" -sTCP:LISTEN 2>/dev/null || true; } | awk 'NR==2{print $1}')"
     [[ -z "$owner" || "$owner" == com.docke* ]] || lab_warn "port $p is held by '$owner' — the lab needs it (docs/08 §1)"
   done
   # Docker Desktop file sharing must cover HARBOR_HOME (bind mounts for Harbor's data/ and log/).
@@ -194,6 +202,7 @@ for s in "${STAGES[@]}"; do
   if [[ -n "$ONLY" ]]; then [[ "$s" == "$ONLY" ]] || continue
   else [[ -z "$FROM" || $run -eq 1 || "$s" == "$FROM" ]] && run=1 || continue; fi
   banner "$s"
+  CURRENT_STAGE="$s"
   "stage_$s"
 done
 

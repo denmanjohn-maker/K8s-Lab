@@ -119,16 +119,29 @@ grep -E '^(hostname|data_volume):|^  (certificate|private_key):|^    location:' 
 lab_render "$LAB_ROOT/harbor/docker-compose.override.yml.template" > "$INSTALL_DIR/docker-compose.override.yml"
 
 # ---- 6. install / reconfigure --------------------------------------------------------
+# Same steps as Harbor's own install.sh (load images → prepare → compose up), done here so that:
+#   - re-runs skip the 2-minute image load when the images are already present,
+#   - the existing stack is stopped, not `down`ed (k3d nodes may be attached to the harbor network),
+#   - the Docker Desktop bind-mount quirk below can be worked around between prepare and up.
 cd "$INSTALL_DIR"
-if [[ -s docker-compose.yml ]] && docker compose ps --status running 2>/dev/null | grep -q harbor-core; then
-  lab_log "Harbor already running — applying config (prepare + compose up)"
-  ./prepare --with-trivy
-  docker compose stop            # not `down`: k3d nodes may be attached to the harbor network
-  docker compose up -d
-else
-  lab_log "running install.sh --with-trivy (loads arm64 images from the tarball, ~2-4 min)"
-  ./install.sh --with-trivy
+IMG_TAG="$(grep -o 'goharbor/prepare:[^ "]*' prepare | head -1 | cut -d: -f2)"
+if [[ -z "$IMG_TAG" ]] || ! docker image inspect "goharbor/prepare:${IMG_TAG}" >/dev/null 2>&1; then
+  lab_log "loading Harbor images from the tarball (~2 min)"
+  docker load -i ./harbor*.tar.gz
 fi
+lab_log "rendering Harbor's compose file and configs (prepare --with-trivy)"
+./prepare --with-trivy
+# Docker Desktop (VirtioFS) fails the first time a file is bind-mounted into a directory that is itself a
+# bind mount, unless the mountpoint already exists on the host (docker/for-mac#7853). Harbor's registry
+# mounts data/secret/registry/root.crt at /etc/registry/root.crt under the ./common/config/registry/
+# mount, and prepare regenerates that directory — so recreate the mountpoint after every prepare.
+touch common/config/registry/root.crt
+if [[ -n "$(docker compose ps -aq 2>/dev/null)" ]]; then
+  lab_log "stopping the existing Harbor containers before applying the new config"
+  docker compose stop
+fi
+lab_log "docker compose up -d"
+docker compose up -d
 
 # ---- 7. wait + report ---------------------------------------------------------------
 lab_log "waiting for https://${HARBOR_HOST}:${HARBOR_HTTPS_PORT}/api/v2.0/health"
